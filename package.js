@@ -1,6 +1,6 @@
 Package.describe({
   name: 'mkarliner:mqtt',
-  version: '0.0.3',
+  version: '0.0.4',
   summary: 'Connect Meteor to MQTT message broker',
   git: 'http://www.github.com/mkarliner/meteor-mqtt',
   documentation: 'README.md'

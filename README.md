@@ -18,4 +18,9 @@ client.on('message', function (topic, message) {
  
 client.end();
 
+See: http://www.modern-industry.com/admin/Article/17-using-mqtt-with-meteor/edit for an article on
+how to use with Meteor.
+
 See: https://www.npmjs.com/package/mqtt for full API
+
+
