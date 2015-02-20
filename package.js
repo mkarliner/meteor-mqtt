@@ -7,20 +7,16 @@ Package.describe({
 });
 
 Npm.depends({
-	"mqtt": "1.0.10",
-	"moment": "2.4.0"
+	"mqtt": "1.0.10"
 	
 })
 
 Package.onUse(function(api) {
-  api.export("mqtt");
-	//api.export("MQTTClient");
-  //api.use("raix:eventemitter",[ "client", "server"]);
   api.versionsFrom('1.0.3.1');
   api.addFiles('mkarliner:server.js', ["server"]);
-  api.addFiles('mkarliner:client.js', ["client"]);
-  api.addFiles('client/lib/mkarliner:browserMqtt.js', ["client"]);
-  //api.addFiles('mkarliner:browserMqtt.js', "client");
+  api.addFiles(['browserMqtt.js'], "client");
+  api.addFiles("test.js")
+    api.export("connect");
 });
 
 Package.onTest(function(api) {

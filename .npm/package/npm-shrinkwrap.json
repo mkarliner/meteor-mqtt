@@ -1,8 +1,5 @@
 {
   "dependencies": {
-    "moment": {
-      "version": "2.4.0"
-    },
     "mqtt": {
       "version": "1.0.10",
       "dependencies": {

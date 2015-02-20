@@ -1,7 +1,7 @@
 // Write your package code here!
 
 mqtt = Npm.require("mqtt");
-var moment = Npm.require("moment");
+//var moment = Npm.require("moment");
 // var mqttClient = {};
 // var clients = {};
 //
