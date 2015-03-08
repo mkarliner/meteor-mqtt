@@ -1,6 +1,6 @@
 Package.describe({
   name: 'mkarliner:mqtt',
-  version: '0.0.5',
+  version: '0.0.6',
   summary: 'Connect Meteor to MQTT message broker',
   git: 'http://www.github.com/mkarliner/meteor-mqtt',
   documentation: 'README.md'
@@ -12,6 +12,7 @@ Npm.depends({
 })
 
 Package.onUse(function(api) {
+  api.export("mqtt", "server");
   api.versionsFrom('1.0.3.1');
   api.addFiles('mkarliner:server.js', ["server"]);
   api.addFiles(['browserMqtt.js'], "client");
