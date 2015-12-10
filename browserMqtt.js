@@ -1,35 +1,61 @@
 !function(e){if("object"==typeof exports&&"undefined"!=typeof module)module.exports=e();else if("function"==typeof define&&define.amd)define([],e);else{var f;"undefined"!=typeof window?f=window:"undefined"!=typeof global?f=global:"undefined"!=typeof self&&(f=self),f.mqtt=e()}}(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 (function (process,global){
+'use strict';
 /**
  * Module dependencies
  */
-var events        = require('events')
-  , Store         = require('./store')
-  , eos           = require('end-of-stream')
-  , mqttPacket    = require('mqtt-packet')
-  , Writable      = require('readable-stream').Writable
-  , inherits      = require('inherits')
-  , setImmediate  = global.setImmediate || function(callback) {
-      // works in node v0.8
-      process.nextTick(callback);
-    };
+/*global setImmediate:true*/
+var events = require('events'),
+  Store = require('./store'),
+  eos = require('end-of-stream'),
+  mqttPacket = require('mqtt-packet'),
+  Writable = require('readable-stream').Writable,
+  inherits = require('inherits'),
+  reInterval = require('reinterval'),
+  setImmediate = global.setImmediate || function (callback) {
+    // works in node v0.8
+    process.nextTick(callback);
+  },
+  defaultConnectOptions = {
+    keepalive: 10,
+    protocolId: 'MQTT',
+    protocolVersion: 4,
+    reconnectPeriod: 1000,
+    connectTimeout: 30 * 1000,
+    clean: true
+  };
 
-/**
- * Default options
- */
-var defaultConnectOptions = {
-  keepalive: 10,
-  protocolId: 'MQTT',
-  protocolVersion: 4,
-  reconnectPeriod: 1000,
-  clean: true
-};
-
-var defaultId = function() {
+function defaultId () {
   return 'mqttjs_' + Math.random().toString(16).substr(2, 8);
-};
+}
 
-function nop() {}
+function sendPacket (client, packet, cb) {
+  try {
+    var buf = mqttPacket.generate(packet);
+    if (!client.stream.write(buf) && cb) {
+      client.stream.once('drain', cb);
+    } else if (cb) {
+      cb();
+    }
+  } catch (err) {
+    if (cb) {
+      cb(err);
+    } else {
+      client.emit('error', err);
+    }
+  }
+}
+
+function storeAndSend (client, packet, cb) {
+  client.outgoingStore.put(packet, function storedPacket (err) {
+    if (err) {
+      return cb && cb(err);
+    }
+    sendPacket(client, packet, cb);
+  });
+}
+
+function nop () {}
 
 /**
  * MqttClient constructor
@@ -38,9 +64,9 @@ function nop() {}
  * @param {Object} [options] - connection options
  * (see Connection#connect)
  */
-var MqttClient = module.exports =
-function MqttClient(streamBuilder, options) {
-  var that = this;
+function MqttClient (streamBuilder, options) {
+  var k,
+    that = this;
 
   if (!(this instanceof MqttClient)) {
     return new MqttClient(streamBuilder, options);
@@ -49,7 +75,7 @@ function MqttClient(streamBuilder, options) {
   this.options = options || {};
 
   // Defaults
-  for(var k in defaultConnectOptions) {
+  for (k in defaultConnectOptions) {
     if ('undefined' === typeof this.options[k]) {
       this.options[k] = defaultConnectOptions[k];
     } else {
@@ -75,21 +101,46 @@ function MqttClient(streamBuilder, options) {
   this.queue = [];
   // Are we intentionally disconnecting?
   this.disconnecting = false;
+  // connack timer
+  this.connackTimer = null;
   // Reconnect timer
   this.reconnectTimer = null;
   // MessageIDs starting with 1
   this.nextId = Math.floor(Math.random() * 65535);
 
   // Inflight callbacks
-  this.outgoing = {}
+  this.outgoing = {};
 
   // Mark connected on connect
-  this.on('connect', function() {
+  this.on('connect', function () {
     this.connected = true;
+    var outStore = null;
+    outStore = this.outgoingStore.createStream();
+
+    // Control of stored messages
+    outStore.once('readable', function () {
+      function storeDeliver () {
+        var packet = outStore.read(1);
+        if (!packet) {
+          return;
+        }
+        // Avoid unnecesary stream read operations when disconnected
+        if (!that.disconnecting && !that.reconnectTimer && (0 < that.options.reconnectPeriod)) {
+          outStore.read(0);
+          // Ensure that the next message will only be read after callback is issued
+          that.outgoing[packet.messageId] = storeDeliver;
+          that._sendPacket(packet);
+        } else if (outStore.destroy) {
+          outStore.destroy();
+        }
+      }
+      storeDeliver();
+    })
+    .on('error', this.emit.bind(this, 'error'));
   });
 
   // Mark disconnected on stream close
-  this.on('close', function() {
+  this.on('close', function () {
     this.connected = false;
   });
 
@@ -97,12 +148,12 @@ function MqttClient(streamBuilder, options) {
   this.on('connect', this._setupPingTimer);
 
   // Send queued packets
-  this.on('connect', function() {
-    var queue     = this.queue;
+  this.on('connect', function () {
+    var queue = this.queue;
 
-    function deliver() {
-      var entry     = queue.shift()
-        , packet    = null;
+    function deliver () {
+      var entry = queue.shift(),
+        packet = null;
 
       if (!entry) {
         return;
@@ -112,7 +163,7 @@ function MqttClient(streamBuilder, options) {
 
       that._sendPacket(
         packet,
-        function(err) {
+        function (err) {
           if (entry.cb) {
             entry.cb(err);
           }
@@ -127,8 +178,8 @@ function MqttClient(streamBuilder, options) {
 
   // Clear ping timer
   this.on('close', function () {
-    if (that.pingTimer !== null) {
-      clearInterval(that.pingTimer);
+    if (null !== that.pingTimer) {
+      that.pingTimer.clear();
       that.pingTimer = null;
     }
   });
@@ -139,7 +190,7 @@ function MqttClient(streamBuilder, options) {
   events.EventEmitter.call(this);
 
   this._setupStream();
-};
+}
 inherits(MqttClient, events.EventEmitter);
 
 /**
@@ -147,24 +198,25 @@ inherits(MqttClient, events.EventEmitter);
  *
  * @api private
  */
-MqttClient.prototype._setupStream = function() {
-  var that = this;
-  var writable = new Writable();
-  var parser = mqttPacket.parser(this.options);
-  var completeParse = null;
-  var packets = [];
+MqttClient.prototype._setupStream = function () {
+  var connectPacket,
+    that = this,
+    writable = new Writable(),
+    parser = mqttPacket.parser(this.options),
+    completeParse = null,
+    packets = [];
 
   this._clearReconnect();
 
   this.stream = this.streamBuilder(this);
 
-  parser.on('packet', function(packet) {
+  parser.on('packet', function (packet) {
     packets.push(packet);
-  })
+  });
 
-  function process() {
-    var packet = packets.shift();
-    var done = completeParse;
+  function process () {
+    var packet = packets.shift(),
+      done = completeParse;
     if (packet) {
       that._handlePacket(packet, process);
     } else {
@@ -173,7 +225,7 @@ MqttClient.prototype._setupStream = function() {
     }
   }
 
-  writable._write = function(buf, enc, done) {
+  writable._write = function (buf, enc, done) {
     completeParse = done;
     parser.parse(buf);
     process();
@@ -182,13 +234,13 @@ MqttClient.prototype._setupStream = function() {
   this.stream.pipe(writable);
 
   // Suppress connection errors
-  this.stream.on('error', nop)
+  this.stream.on('error', nop);
 
   // Echo stream close
   eos(this.stream, this.emit.bind(this, 'close'));
 
   // Send a connect packet
-  var connectPacket = Object.create(this.options);
+  connectPacket = Object.create(this.options);
   connectPacket.cmd = 'connect';
   // avoid message queue
   sendPacket(this, connectPacket);
@@ -196,15 +248,16 @@ MqttClient.prototype._setupStream = function() {
   // Echo connection errors
   parser.on('error', this.emit.bind(this, 'error'));
 
-  this.outgoingStore
-    .createStream()
-    .on('data', function(packet) {
-      that._sendPacket(packet);
-    })
-    .on('error', this.emit.bind(this, 'error'));
+  // many drain listeners are needed for qos 1 callbacks if the connection is intermittent
+  this.stream.setMaxListeners(1000);
+
+  clearTimeout(this.connackTimer);
+  this.connackTimer = setTimeout(function () {
+    that._cleanUp(true);
+  }, this.options.connectTimeout);
 };
 
-MqttClient.prototype._handlePacket = function(packet, done) {
+MqttClient.prototype._handlePacket = function (packet, done) {
   switch (packet.cmd) {
     case 'publish':
       this._handlePublish(packet, done);
@@ -228,10 +281,17 @@ MqttClient.prototype._handlePacket = function(packet, done) {
       this._handlePingresp(packet);
       done();
       break;
+    default:
+      // do nothing
+      // maybe we should do an error handling
+      // or just log it
+      break;
   }
+  // When a packet is received, reschedule the ping timer
+  this._shiftPingInterval();
 };
 
-MqttClient.prototype._checkDisconnecting = function(callback) {
+MqttClient.prototype._checkDisconnecting = function (callback) {
   if (this.disconnecting) {
     if (callback) {
       callback(new Error('client disconnecting'));
@@ -240,7 +300,7 @@ MqttClient.prototype._checkDisconnecting = function(callback) {
     }
   }
   return this.disconnecting;
-}
+};
 
 /**
  * publish - publish <message> to <topic>
@@ -260,8 +320,7 @@ MqttClient.prototype._checkDisconnecting = function(callback) {
  *     client.publish('topic', 'message', {qos: 1, retain: true});
  * @example client.publish('topic', 'message', console.log);
  */
-MqttClient.prototype.publish =
-function(topic, message, opts, callback) {
+MqttClient.prototype.publish = function (topic, message, opts, callback) {
   var packet;
 
   // .publish(topic, payload, cb);
@@ -271,16 +330,16 @@ function(topic, message, opts, callback) {
   }
 
   // Default opts
-  if (!opts) opts = {qos: 0, retain: false};
+  if (!opts) {
+    opts = {qos: 0, retain: false};
+  }
 
   if (this._checkDisconnecting(callback)) {
     return this;
   }
 
-  callback = callback || nop;
-
   packet = {
-    cmd: "publish",
+    cmd: 'publish',
     topic: topic,
     payload: message,
     qos: opts.qos,
@@ -291,8 +350,9 @@ function(topic, message, opts, callback) {
   switch (opts.qos) {
     case 1:
     case 2:
+
       // Add to callbacks
-      this.outgoing[packet.messageId] = callback;
+      this.outgoing[packet.messageId] = callback || nop;
       this._sendPacket(packet);
       break;
     default:
@@ -319,16 +379,15 @@ function(topic, message, opts, callback) {
  * @example client.subscribe({'topic': 0, 'topic2': 1}, console.log);
  * @example client.subscribe('topic', console.log);
  */
-MqttClient.prototype.subscribe =
-function() {
-  var args = Array.prototype.slice.call(arguments)
-    , subs = [];
+MqttClient.prototype.subscribe = function () {
+  var packet,
+    args = Array.prototype.slice.call(arguments),
+    subs = [],
+    obj = args.shift(),
+    callback = args.pop() || nop,
+    opts = args.pop();
 
-  var obj = args.shift()
-    , callback = args.pop() || nop
-    , opts = args.pop();
-
-  if (typeof obj === 'string') {
+  if ('string' === typeof obj) {
     obj = [obj];
   }
 
@@ -336,7 +395,7 @@ function() {
     return this;
   }
 
-  if (typeof callback !== 'function') {
+  if ('function' !== typeof callback) {
     opts = callback;
     callback = nop;
   }
@@ -346,7 +405,7 @@ function() {
   }
 
   if (Array.isArray(obj)) {
-    obj.forEach(function(topic) {
+    obj.forEach(function (topic) {
       subs.push({
         topic: topic,
         qos: opts.qos
@@ -355,7 +414,7 @@ function() {
   } else {
     Object
       .keys(obj)
-      .forEach(function(k) {
+      .forEach(function (k) {
         subs.push({
           topic: k,
           qos: obj[k]
@@ -363,8 +422,8 @@ function() {
       });
   }
 
-  var packet = {
-    cmd: "subscribe",
+  packet = {
+    cmd: 'subscribe',
     subscriptions: subs,
     qos: 1,
     retain: false,
@@ -389,13 +448,14 @@ function() {
  * @example client.unsubscribe('topic');
  * @example client.unsubscribe('topic', console.log);
  */
-MqttClient.prototype.unsubscribe = function(topic, callback) {
-  callback = callback || nop;
+MqttClient.prototype.unsubscribe = function (topic, callback) {
   var packet = {
-    cmd: "unsubscribe",
+    cmd: 'unsubscribe',
     qos: 1,
     messageId: this._nextId()
   };
+
+  callback = callback || nop;
 
   if (this._checkDisconnecting(callback)) {
     return this;
@@ -418,19 +478,27 @@ MqttClient.prototype.unsubscribe = function(topic, callback) {
  * end - close connection
  *
  * @returns {MqttClient} this - for chaining
+ * @param {Boolean} force - do not wait for all in-flight messages to be acked
+ * @param {Function} cb - called when the client has been closed
+ *
  * @api public
  */
-MqttClient.prototype.end = function(cb) {
+MqttClient.prototype.end = function (force, cb) {
   var that = this;
 
-  function closeStores() {
-    that.incomingStore.close(function() {
+  if ('function' === typeof force) {
+    cb = force;
+    force = false;
+  }
+
+  function closeStores () {
+    that.incomingStore.close(function () {
       that.outgoingStore.close(cb);
     });
   }
 
-  function finish() {
-    that._cleanUp(false, closeStores)
+  function finish () {
+    that._cleanUp(force, closeStores);
   }
 
   if (this.disconnecting) {
@@ -439,7 +507,7 @@ MqttClient.prototype.end = function(cb) {
 
   this.disconnecting = true;
 
-  if (Object.keys(this.outgoing).length > 0) {
+  if (!force && 0 < Object.keys(this.outgoing).length) {
     // wait 10ms, just to be sure we received all of it
     this.once('outgoingEmpty', setTimeout.bind(null, finish, 10));
   } else {
@@ -453,7 +521,7 @@ MqttClient.prototype.end = function(cb) {
  * _reconnect - implement reconnection
  * @api privateish
  */
-MqttClient.prototype._reconnect = function() {
+MqttClient.prototype._reconnect = function () {
   this.emit('reconnect');
   this._setupStream();
 };
@@ -461,10 +529,10 @@ MqttClient.prototype._reconnect = function() {
 /**
  * _setupReconnect - setup reconnect timer
  */
-MqttClient.prototype._setupReconnect = function() {
+MqttClient.prototype._setupReconnect = function () {
   var that = this;
 
-  if (!that.disconnecting && !that.reconnectTimer && (that.options.reconnectPeriod > 0)) {
+  if (!that.disconnecting && !that.reconnectTimer && (0 < that.options.reconnectPeriod)) {
     this.emit('offline');
     that.reconnectTimer = setInterval(function () {
       that._reconnect();
@@ -475,7 +543,7 @@ MqttClient.prototype._setupReconnect = function() {
 /**
  * _clearReconnect - clear the reconnect timer
  */
-MqttClient.prototype._clearReconnect = function() {
+MqttClient.prototype._clearReconnect = function () {
   if (this.reconnectTimer) {
     clearInterval(this.reconnectTimer);
     this.reconnectTimer = false;
@@ -487,7 +555,8 @@ MqttClient.prototype._clearReconnect = function() {
  * _cleanUp - clean up on connection end
  * @api private
  */
-MqttClient.prototype._cleanUp = function(forced, done) {
+MqttClient.prototype._cleanUp = function (forced, done) {
+
   if (done) {
     this.stream.on('close', done);
   }
@@ -496,7 +565,7 @@ MqttClient.prototype._cleanUp = function(forced, done) {
     this.stream.destroy();
   } else {
     this._sendPacket(
-      { cmd: "disconnect" },
+      { cmd: 'disconnect' },
       setImmediate.bind(
         null,
         this.stream.end.bind(this.stream)
@@ -504,40 +573,16 @@ MqttClient.prototype._cleanUp = function(forced, done) {
     );
   }
 
-  this._clearReconnect();
+  if (this.reconnectTimer) {
+    this._clearReconnect();
+    this._setupReconnect();
+  }
 
-  if (this.pingTimer !== null) {
-    clearInterval(this.pingTimer);
+  if (null !== this.pingTimer) {
+    this.pingTimer.clear();
     this.pingTimer = null;
   }
 };
-
-
-function sendPacket(client, packet, cb) {
-  try {
-    var buf = mqttPacket.generate(packet);
-    if (!client.stream.write(buf) && cb) {
-      client.stream.once('drain', cb);
-    } else if (cb) {
-      cb();
-    }
-  } catch(err) {
-    if (cb) {
-      cb(err);
-    } else {
-      client.emit('error', err);
-    }
-  }
-}
-
-function storeAndSend(client, packet, cb) {
-  client.outgoingStore.put(packet, function storedPacket(err) {
-    if (err) {
-      return cb && cb(err);
-    }
-    sendPacket(client, packet, cb);
-  })
-}
 
 /**
  * _sendPacket - send or queue a packet
@@ -546,7 +591,7 @@ function storeAndSend(client, packet, cb) {
  * @param {Function} cb - callback when the packet is sent
  * @api private
  */
-MqttClient.prototype._sendPacket = function(packet, cb) {
+MqttClient.prototype._sendPacket = function (packet, cb) {
   if (!this.connected) {
     return this.queue.push({ packet: packet, cb: cb });
   }
@@ -556,7 +601,13 @@ MqttClient.prototype._sendPacket = function(packet, cb) {
     case 1:
       storeAndSend(this, packet, cb);
       break;
+    /**
+     * no need of case here since it will be caught by default
+     * and jshint comply that before default it must be a break
+     * anyway it will result in -1 evaluation
+     */
     case 0:
+      /* falls through */
     default:
       sendPacket(this, packet, cb);
       break;
@@ -568,17 +619,27 @@ MqttClient.prototype._sendPacket = function(packet, cb) {
  *
  * @api private
  */
-MqttClient.prototype._setupPingTimer = function() {
+MqttClient.prototype._setupPingTimer = function () {
   var that = this;
 
   if (!this.pingTimer && this.options.keepalive) {
     this.pingResp = true;
-    this.pingTimer = setInterval(function () {
-        that._checkPing();
+    this.pingTimer = reInterval(function () {
+      that._checkPing();
     }, this.options.keepalive * 1000);
   }
 };
 
+/**
+ * _shiftPingInterval - reschedule the ping interval
+ *
+ * @api private
+ */
+MqttClient.prototype._shiftPingInterval = function () {
+  if (this.pingTimer && this.options.keepalive) {
+    this.pingTimer.reschedule(this.options.keepalive * 1000);
+  }
+};
 /**
  * _checkPing - check if a pingresp has come back, and ping the server again
  *
@@ -587,7 +648,7 @@ MqttClient.prototype._setupPingTimer = function() {
 MqttClient.prototype._checkPing = function () {
   if (this.pingResp) {
     this.pingResp = false;
-    this._sendPacket({ cmd: "pingreq" });
+    this._sendPacket({ cmd: 'pingreq' });
   } else {
     // do a forced cleanup since socket will be in bad shape
     this._cleanUp(true);
@@ -610,22 +671,23 @@ MqttClient.prototype._handlePingresp = function () {
  * @api private
  */
 
-MqttClient.prototype._handleConnack = function(packet) {
-  var rc = packet.returnCode;
+MqttClient.prototype._handleConnack = function (packet) {
+  var rc = packet.returnCode,
+    // TODO: move to protocol
+    errors = [
+      '',
+      'Unacceptable protocol version',
+      'Identifier rejected',
+      'Server unavailable',
+      'Bad username or password',
+      'Not authorized'
+    ];
 
-  // TODO: move to protocol
-  var errors = [
-    '',
-    'Unacceptable protocol version',
-    'Identifier rejected',
-    'Server unavailable',
-    'Bad username or password',
-    'Not authorized'
-  ];
+  clearTimeout(this.connackTimer);
 
-  if (rc === 0) {
-    this.emit('connect');
-  } else if (rc > 0) {
+  if (0 === rc) {
+    this.emit('connect', packet);
+  } else if (0 < rc) {
     this.emit('error',
         new Error('Connection refused: ' + errors[rc]));
   }
@@ -637,31 +699,60 @@ MqttClient.prototype._handleConnack = function(packet) {
  * @param {Object} packet
  * @api private
  */
+/*
+those late 2 case should be rewrite to comply with coding style:
 
-MqttClient.prototype._handlePublish = function(packet, done) {
-  var topic = packet.topic.toString()
-    , message = packet.payload
-    , qos = packet.qos
-    , mid = packet.messageId
-    , that = this;
+case 1:
+case 0:
+  // do not wait sending a puback
+  // no callback passed
+  if (1 === qos) {
+    this._sendPacket({
+      cmd: 'puback',
+      messageId: mid
+    });
+  }
+  // emit the message event for both qos 1 and 0
+  this.emit('message', topic, message, packet);
+  this.handleMessage(packet, done);
+  break;
+default:
+  // do nothing but every switch mus have a default
+  // log or throw an error about unknown qos
+  break;
+
+for now i just suppressed the warnings
+*/
+MqttClient.prototype._handlePublish = function (packet, done) {
+  var topic = packet.topic.toString(),
+    message = packet.payload,
+    qos = packet.qos,
+    mid = packet.messageId,
+    that = this;
 
   switch (qos) {
     case 2:
-      this.incomingStore.put(packet, function() {
-        that._sendPacket({cmd: "pubrec", messageId: mid}, done);
-      })
+      this.incomingStore.put(packet, function () {
+        that._sendPacket({cmd: 'pubrec', messageId: mid}, done);
+      });
       break;
     case 1:
       // do not wait sending a puback
       // no callback passed
       this._sendPacket({
-        cmd: "puback",
+        cmd: 'puback',
         messageId: mid
       });
+      /* falls through */
     case 0:
       // emit the message event for both qos 1 and 0
       this.emit('message', topic, message, packet);
       this.handleMessage(packet, done);
+      break;
+    default:
+      // do nothing
+      // log or throw an error about unknown qos
+      break;
   }
 };
 
@@ -673,7 +764,7 @@ MqttClient.prototype._handlePublish = function(packet, done) {
  * @param Function callback call when finished
  * @api public
  */
-MqttClient.prototype.handleMessage = function(packet, callback) {
+MqttClient.prototype.handleMessage = function (packet, callback) {
   callback();
 };
 
@@ -684,12 +775,12 @@ MqttClient.prototype.handleMessage = function(packet, callback) {
  * @api private
  */
 
-MqttClient.prototype._handleAck = function(packet) {
-  var mid = packet.messageId
-    , type = packet.cmd
-    , response = null
-    , cb = this.outgoing[mid]
-    , that = this;
+MqttClient.prototype._handleAck = function (packet) {
+  var mid = packet.messageId,
+    type = packet.cmd,
+    response = null,
+    cb = this.outgoing[mid],
+    that = this;
 
   if (!cb) {
     // Server sent an ack in error, ignore it.
@@ -707,41 +798,42 @@ MqttClient.prototype._handleAck = function(packet) {
       break;
     case 'pubrec':
       response = {
-        cmd: "pubrel",
+        cmd: 'pubrel',
         qos: 2,
         messageId: mid
-      }
+      };
 
-      this._sendPacket(response)
+      this._sendPacket(response);
       break;
     case 'suback':
       delete this.outgoing[mid];
-      this.outgoingStore.del(packet, function(err, original) {
+      this.outgoingStore.del(packet, function (err, original) {
+        var i,
+          origSubs = original.subscriptions,
+          granted = packet.granted;
+
         if (err) {
           // missing packet, what should we do?
           return that.emit('error', err);
         }
 
-        var origSubs = original.subscriptions
-          , granted = packet.granted;
-
-        for (var i = 0; i < granted.length; i += 1) {
+        for (i = 0; i < granted.length; i += 1) {
           origSubs[i].qos = granted[i];
         }
 
         cb(null, origSubs);
-      })
+      });
       break;
     case 'unsuback':
       delete this.outgoing[mid];
       this.outgoingStore.del(packet, cb);
       break;
     default:
-      // code
+      that.emit('error', new Error('unrecognized packet type'));
   }
 
   if (this.disconnecting &&
-      Object.keys(this.outgoing).length === 0) {
+      0 === Object.keys(this.outgoing).length) {
     this.emit('outgoingEmpty');
   }
 };
@@ -753,76 +845,93 @@ MqttClient.prototype._handleAck = function(packet) {
  * @api private
  */
 
-MqttClient.prototype._handlePubrel = function(packet) {
-  var mid = packet.messageId
-    , that = this;
+MqttClient.prototype._handlePubrel = function (packet, callback) {
+  var mid = packet.messageId,
+    that = this;
 
-  that.incomingStore.get(packet, function(err, pub) {
-    if (err) return that.emit('error', err);
+  that.incomingStore.get(packet, function (err, pub) {
+    if (err) {
+      return that.emit('error', err);
+    }
 
-    if (pub.cmd !== "pubrel") {
+    if ('pubrel' !== pub.cmd) {
       that.emit('message', pub.topic, pub.payload, pub);
       that.incomingStore.put(packet);
     }
 
-    that._sendPacket({cmd: "pubcomp", messageId: mid});
+    that._sendPacket({cmd: 'pubcomp', messageId: mid}, callback);
   });
 };
 
 /**
  * _nextId
  */
-MqttClient.prototype._nextId = function() {
+MqttClient.prototype._nextId = function () {
   var id = this.nextId++;
   // Ensure 16 bit unsigned int:
-  if (id === 65535) {
+  if (65535 === id) {
     this.nextId = 1;
   }
   return id;
 };
 
-}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./store":5,"_process":44,"end-of-stream":7,"events":41,"inherits":10,"mqtt-packet":13,"readable-stream":26}],2:[function(require,module,exports){
+module.exports = MqttClient;
 
+}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./store":5,"_process":65,"end-of-stream":7,"events":62,"inherits":10,"mqtt-packet":13,"readable-stream":26,"reinterval":27}],2:[function(require,module,exports){
+'use strict';
 var net = require('net');
 
-function buildBuilder(client, opts) {
-  opts.port     = opts.port || 1883;
+/*
+  variables port and host can be removed since
+  you have all required information in opts object
+*/
+function buildBuilder (client, opts) {
+  var port, host;
+  opts.port = opts.port || 1883;
   opts.hostname = opts.hostname || opts.host || 'localhost';
 
-  var port = opts.port
-    , host = opts.hostname;
+  port = opts.port;
+  host = opts.hostname;
 
   return net.createConnection(port, host);
 }
 
 module.exports = buildBuilder;
 
+},{"net":57}],3:[function(require,module,exports){
+'use strict';
+var tls = require('tls');
 
-},{"net":36}],3:[function(require,module,exports){
+function buildBuilder (mqttClient, opts) {
+  var connection;
+  opts.port = opts.port || 8883;
+  opts.host = opts.hostname || opts.host || 'localhost';
 
-var tls = require("tls")
+  opts.rejectUnauthorized = false !== opts.rejectUnauthorized;
 
-function buildBuilder(mqttClient, opts) {
-  opts.port     = opts.port || 8883;
-  opts.host     = opts.hostname || opts.host || 'localhost';
-
-  opts.rejectUnauthorized = !(opts.rejectUnauthorized === false);
-
-  var connection = tls.connect(opts)
-
-  connection.on('secureConnect', function() {
+  connection = tls.connect(opts);
+  /*eslint no-use-before-define: [2, "nofunc"]*/
+  connection.on('secureConnect', function () {
     if (opts.rejectUnauthorized && !connection.authorized) {
       connection.emit('error', new Error('TLS not authorized'));
     } else {
-      connection.removeListener('error', handleTLSerrors)
+      connection.removeListener('error', handleTLSerrors);
     }
   });
 
-  function handleTLSerrors(err) {
+  /*
+   * to comply with strict rules, a function must be
+   * declared before it can be used
+   * so i moved it has to be  moved before its first call
+   * later on maybe we can move all of them to the top of the file
+   * for now i just suppressed the warning
+   */
+  /*jshint latedef:false*/
+  function handleTLSerrors (err) {
     // How can I get verify this error is a tls error?
     if (opts.rejectUnauthorized) {
-      mqttClient.emit('error', err)
+      mqttClient.emit('error', err);
     }
 
     // close this connection to match the behaviour of net
@@ -832,88 +941,107 @@ function buildBuilder(mqttClient, opts) {
     // net.createConnection
     connection.end();
   }
+  /*jshint latedef:false*/
 
-  connection.on('error', handleTLSerrors)
-
+  connection.on('error', handleTLSerrors);
   return connection;
 }
 
 module.exports = buildBuilder;
 
-
-},{"tls":36}],4:[function(require,module,exports){
+},{"tls":57}],4:[function(require,module,exports){
 (function (process){
+'use strict';
 
-var websocket = require('websocket-stream');
-var URL = require('url');
+var websocket = require('websocket-stream'),
+  _URL = require('url');
 
-function buildBuilder(client, opts) {
-  var host = opts.hostname || 'localhost'
-    , port = opts.port || 80
-    , url = opts.protocol + '://' + host + ':' + port
-    , ws =  websocket(url, {
-        protocol: 'mqttv3.1'
-      });
+function buildBuilder (client, opts) {
+  var wsOpt = {
+      protocol: 'mqttv3.1'
+    },
+    host = opts.hostname || 'localhost',
+    port = String(opts.port || 80),
+    path = opts.path || '/',
+    url = opts.protocol + '://' + host + ':' + port + path;
 
-  return ws;
+  if ('wss' === opts.protocol) {
+    if (opts.hasOwnProperty('rejectUnauthorized')) {
+      wsOpt.rejectUnauthorized = opts.rejectUnauthorized;
+    }
+  }
+
+  return websocket(url, wsOpt);
 }
 
-function buildBuilderBrowser(mqttClient, opts) {
-  var parsed = URL.parse(document.URL);
+function buildBuilderBrowser (mqttClient, opts) {
+  var url, parsed;
+  if ('undefined' !== typeof (document)) { // for Web Workers! P.S: typeof(document) !== undefined may be becoming the faster one these days.
+    parsed = _URL.parse(document.URL);
+  } else {
+    throw new Error('Could not determine host. Specify host manually.');
+  }
 
   if (!opts.protocol) {
-    if (parsed.protocol === 'https:') {
+    if ('https:' === parsed.protocol) {
       opts.protocol = 'wss';
     } else {
       opts.protocol = 'ws';
     }
   }
 
-  if (!opts.host) {
-    opts.host = parsed.hostname;
+  if (!opts.hostname) {
+    opts.hostname = opts.host;
+  }
+
+  if (!opts.hostname) {
+    opts.hostname = parsed.hostname;
     if (!opts.port) {
       opts.port = parsed.port;
     }
   }
 
   if (!opts.port) {
-    if (opts.protocol === "wss") {
+    if ('wss' === opts.protocol) {
       opts.port = 443;
     } else {
       opts.port = 80;
     }
   }
 
-  var host = opts.hostname || opts.host
-    , port = opts.port
-    , url = opts.protocol + '://' + host + ':' + opts.port
+  if (!opts.path) {
+    opts.path = '/';
+  }
+
+  url = opts.protocol + '://' + opts.hostname + ':' + opts.port + opts.path;
 
   return websocket(url, 'mqttv3.1');
 }
 
-if (process.title !== 'browser') {
+if ('browser' !== process.title) {
   module.exports = buildBuilder;
 } else {
   module.exports = buildBuilderBrowser;
 }
 
 }).call(this,require('_process'))
-},{"_process":44,"url":62,"websocket-stream":33}],5:[function(require,module,exports){
-
-var PassThrough = require('readable-stream').PassThrough
-  , streamsOpts = { objectMode: true };
+},{"_process":65,"url":83,"websocket-stream":54}],5:[function(require,module,exports){
+(function (process){
+'use strict';
+var Readable = require('readable-stream').Readable,
+  streamsOpts = { objectMode: true };
 
 /**
  * In-memory implementation of the message store
  * This can actually be saved into files.
  *
  */
-function Store() {
+function Store () {
   if (!(this instanceof Store)) {
     return new Store();
   }
 
-  this._inflights = {}
+  this._inflights = {};
 }
 
 /**
@@ -921,7 +1049,7 @@ function Store() {
  * anything that has a messageId property.
  *
  */
-Store.prototype.put = function(packet, cb) {
+Store.prototype.put = function (packet, cb) {
   this._inflights[packet.messageId] = packet;
 
   if (cb) {
@@ -935,16 +1063,34 @@ Store.prototype.put = function(packet, cb) {
  * Creates a stream with all the packets in the store
  *
  */
-Store.prototype.createStream = function() {
-  var stream  = new PassThrough(streamsOpts)
-    , ids     = Object.keys(this._inflights)
-    , i       = 0;
+Store.prototype.createStream = function () {
+  var stream = new Readable(streamsOpts),
+    inflights = this._inflights,
+    ids = Object.keys(this._inflights),
+    destroyed = false,
+    i = 0;
 
-  for (i = 0; i < ids.length; i++) {
-    stream.write(this._inflights[ids[i]]);
-  }
+  stream._read = function () {
+    if (!destroyed && i < ids.length) {
+      this.push(inflights[ids[i++]]);
+    } else {
+      this.push(null);
+    }
+  };
 
-  stream.end();
+  stream.destroy = function () {
+    if (destroyed) {
+      return;
+    }
+
+    var self = this;
+
+    destroyed = true;
+
+    process.nextTick(function () {
+      self.emit('close');
+    });
+  };
 
   return stream;
 };
@@ -952,7 +1098,7 @@ Store.prototype.createStream = function() {
 /**
  * deletes a packet from the store.
  */
-Store.prototype.del = function(packet, cb) {
+Store.prototype.del = function (packet, cb) {
   packet = this._inflights[packet.messageId];
   if (packet) {
     delete this._inflights[packet.messageId];
@@ -967,7 +1113,7 @@ Store.prototype.del = function(packet, cb) {
 /**
  * get a packet from the store.
  */
-Store.prototype.get = function(packet, cb) {
+Store.prototype.get = function (packet, cb) {
   packet = this._inflights[packet.messageId];
   if (packet) {
     cb(null, packet);
@@ -981,34 +1127,35 @@ Store.prototype.get = function(packet, cb) {
 /**
  * Close the store
  */
-Store.prototype.close = function(cb) {
+Store.prototype.close = function (cb) {
   this._inflights = null;
   if (cb) {
     cb();
   }
 };
 
-module.exports = Store
+module.exports = Store;
 
-},{"readable-stream":26}],6:[function(require,module,exports){
+}).call(this,require('_process'))
+},{"_process":65,"readable-stream":26}],6:[function(require,module,exports){
 (function (process){
+'use strict';
+var MqttClient = require('../client'),
+  url = require('url'),
+  xtend = require('xtend'),
+  protocols = {},
+  protocolList = [];
 
-var MqttClient      = require('../client')
-  , url             = require('url')
-  , xtend           = require('xtend')
-  , protocols       = {}
-  , protocolList    = [];
-
-if (process.title !== 'browser') {
-  protocols.mqtt  = require('./tcp');
-  protocols.tcp   = require('./tcp');
-  protocols.ssl   = require('./tls');
-  protocols.tls   = require('./tls');
+if ('browser' !== process.title) {
+  protocols.mqtt = require('./tcp');
+  protocols.tcp = require('./tcp');
+  protocols.ssl = require('./tls');
+  protocols.tls = require('./tls');
   protocols.mqtts = require('./tls');
 }
 
-protocols.ws      = require('./ws');
-protocols.wss     = require('./ws');
+protocols.ws = require('./ws');
+protocols.wss = require('./ws');
 
 protocolList = [
   'mqtt',
@@ -1023,10 +1170,11 @@ protocolList = [
  *
  * @param {Object} [opts] option object
  */
-function parseAuthOptions(opts) {
-  if(opts.auth){
-    var matches = opts.auth.match(/^(.+):(.+)$/);
-    if(matches) {
+function parseAuthOptions (opts) {
+  var matches;
+  if (opts.auth) {
+    matches = opts.auth.match(/^(.+):(.+)$/);
+    if (matches) {
       opts.username = matches[1];
       opts.password = matches[2];
     } else {
@@ -1041,10 +1189,9 @@ function parseAuthOptions(opts) {
  * @param {String} [brokerUrl] - url of the broker, optional
  * @param {Object} opts - see MqttClient#constructor
  */
-function connect(brokerUrl, opts) {
-  var func;
+function connect (brokerUrl, opts) {
 
-  if (typeof brokerUrl === 'object' && !opts) {
+  if (('object' === typeof brokerUrl) && !opts) {
     opts = brokerUrl;
     brokerUrl = null;
   }
@@ -1067,6 +1214,15 @@ function connect(brokerUrl, opts) {
   if (opts.cert && opts.key) {
     if (opts.protocol) {
       if (-1 === ['mqtts', 'wss'].indexOf(opts.protocol)) {
+        /*
+         * jshint and eslint
+         * complains that break from default cannot be reached after throw
+         * it is a foced exit from a control structure
+         * maybe add a check after switch to see if it went through default
+         * and then throw the error
+        */
+        /*jshint -W027*/
+        /*eslint no-unreachable:1*/
         switch (opts.protocol) {
           case 'mqtt':
             opts.protocol = 'mqtts';
@@ -1078,25 +1234,27 @@ function connect(brokerUrl, opts) {
             throw new Error('Unknown protocol for secure conenction: "' + opts.protocol + '"!');
             break;
         }
+        /*eslint no-unreachable:0*/
+        /*jshint +W027*/
       }
     } else {
       // don't know what protocol he want to use, mqtts or wss
-      throw new Error("Missing secure protocol key");
+      throw new Error('Missing secure protocol key');
     }
   }
 
   if (!protocols[opts.protocol]) {
-    opts.protocol = protocolList.filter(function(key) {
-      return typeof protocols[key] === 'function';
+    opts.protocol = protocolList.filter(function (key) {
+      return 'function' === typeof protocols[key];
     })[0];
   }
 
-  if (opts.clean === false && !opts.clientId) {
-    throw new Error("Missing clientId for unclean clients");
+  if (false === opts.clean && !opts.clientId) {
+    throw new Error('Missing clientId for unclean clients');
   }
 
 
-  function wrapper(client) {
+  function wrapper (client) {
     if (opts.servers) {
       if (!client._reconnectCount || client._reconnectCount === opts.servers.length) {
         client._reconnectCount = 0;
@@ -1118,7 +1276,7 @@ module.exports = connect;
 module.exports.connect = connect;
 
 }).call(this,require('_process'))
-},{"../client":1,"./tcp":2,"./tls":3,"./ws":4,"_process":44,"url":62,"xtend":35}],7:[function(require,module,exports){
+},{"../client":1,"./tcp":2,"./tls":3,"./ws":4,"_process":65,"url":83,"xtend":56}],7:[function(require,module,exports){
 var once = require('once');
 
 var noop = function() {};
@@ -1349,7 +1507,7 @@ var protocol = require('./constants')
 
 function generate(packet) {
 
-  switch(packet.cmd) {
+  switch (packet.cmd) {
     case 'connect':
       return connect(packet)
     case 'connack':
@@ -1384,7 +1542,7 @@ function connect(opts) {
     , will = opts.will
     , clean = opts.clean
     , keepalive = opts.keepalive || 0
-    , clientId = opts.clientId
+    , clientId = opts.clientId || ""
     , username = opts.username
     , password = opts.password
 
@@ -1395,7 +1553,7 @@ function connect(opts) {
   var length = 0
 
   // Must be a string and non-falsy
-  if(!protocolId ||
+  if (!protocolId ||
      (typeof protocolId !== "string" && !Buffer.isBuffer(protocolId))) {
     throw new Error('Invalid protocol id')
   } else {
@@ -1413,12 +1571,23 @@ function connect(opts) {
     length += 1
   }
 
-  // Must be a non-falsy string
-  if(!clientId ||
-     (typeof clientId !== "string" && !Buffer.isBuffer(clientId))) {
-    throw new Error('Invalid client id')
-  } else {
+  // ClientId might be omitted in 3.1.1, but only if cleanSession is set to 1
+  if ((typeof clientId === "string" || Buffer.isBuffer(clientId)) &&
+     (clientId || protocolVersion == 4) &&
+     (clientId || clean)) {
+
     length += clientId.length + 2
+  } else {
+
+    if(protocolVersion < 4) {
+
+      throw new Error('clientId must be supplied before 3.1.1');
+    }
+
+    if(clean == 0) {
+
+      throw new Error('clientId must be given if cleanSession set to 0');
+    }
   }
 
   // Must be a two byte number
@@ -1443,7 +1612,7 @@ function connect(opts) {
     if (!will.topic || 'string' !== typeof will.topic) {
       throw new Error('Invalid will topic')
     } else {
-      length += will.topic.length + 2
+      length += Buffer.byteLength(will.topic) + 2
     }
 
     // Payload
@@ -1465,7 +1634,7 @@ function connect(opts) {
   // Username
   if (username) {
     if (username.length) {
-      length += username.length + 2
+      length += Buffer.byteLength(username) + 2
     } else {
       throw new Error('Invalid username')
     }
@@ -1474,7 +1643,7 @@ function connect(opts) {
   // Password
   if (password) {
     if (password.length) {
-      length += password.length + 2
+      length += byteLength(password) + 2
     } else {
       throw new Error('Invalid password')
     }
@@ -1484,14 +1653,14 @@ function connect(opts) {
     , pos = 0
 
   // Generate header
-  buffer.writeUInt8(protocol.codes['connect'] << protocol.CMD_SHIFT, pos++)
+  buffer.writeUInt8(protocol.codes['connect'] << protocol.CMD_SHIFT, pos++, true)
 
   // Generate length
   pos += writeLength(buffer, pos, length)
 
   // Generate protocol ID
   pos += writeStringOrBuffer(buffer, pos, protocolId)
-  buffer.writeUInt8(protocolVersion, pos++)
+  buffer.writeUInt8(protocolVersion, pos++, true)
 
   // Connect flags
   var flags = 0
@@ -1503,7 +1672,7 @@ function connect(opts) {
   flags |= will ? protocol.WILL_FLAG_MASK : 0
   flags |= clean ? protocol.CLEAN_SESSION_MASK : 0
 
-  buffer.writeUInt8(flags, pos++)
+  buffer.writeUInt8(flags, pos++, true)
 
   // Keepalive
   pos += writeNumber(buffer, pos, keepalive)
@@ -1538,10 +1707,10 @@ function connack(opts) {
   var buffer = new Buffer(4)
     , pos = 0;
 
-  buffer.writeUInt8(protocol.codes['connack'] << protocol.CMD_SHIFT, pos++);
+  buffer.writeUInt8(protocol.codes['connack'] << protocol.CMD_SHIFT, pos++, true);
   pos += writeLength(buffer, pos, 2);
-  buffer.writeUInt8(opts.sessionPresent && protocol.SESSIONPRESENT_MASK || 0, pos++);
-  buffer.writeUInt8(rc, pos++);
+  buffer.writeUInt8(opts.sessionPresent && protocol.SESSIONPRESENT_MASK || 0, pos++, true);
+  buffer.writeUInt8(rc, pos++, true);
 
   return buffer;
 }
@@ -1583,11 +1752,11 @@ function publish(opts) {
     , pos = 0;
 
   // Header
-  buffer[pos++] =
+  buffer.writeUInt8(
     protocol.codes['publish'] << protocol.CMD_SHIFT |
     dup |
     qos << protocol.QOS_SHIFT |
-    retain;
+    retain, pos++, true);
 
   // Remaining length
   pos += writeLength(buffer, pos, length);
@@ -1620,8 +1789,6 @@ function confirmation(opts) {
 
   if (type === 'pubrel')
     qos = 1
-  else if (type === 'pubcomp')
-    qos = 2
 
   // Check message ID
   if ('number' !== typeof id)
@@ -1686,7 +1853,7 @@ function subscribe(opts) {
   buffer.writeUInt8(
     protocol.codes['subscribe'] << protocol.CMD_SHIFT |
     dup |
-    1 << protocol.QOS_SHIFT, pos++);
+    1 << protocol.QOS_SHIFT, pos++, true);
 
   // Generate length
   pos += writeLength(buffer, pos, length);
@@ -1703,7 +1870,7 @@ function subscribe(opts) {
     // Write topic string
     pos += writeString(buffer, pos, topic);
     // Write qos
-    buffer.writeUInt8(qos, pos++);
+    buffer.writeUInt8(qos, pos++, true);
   }
 
   return buffer;
@@ -1738,7 +1905,7 @@ function suback(opts) {
     , pos = 0;
 
   // Header
-  buffer.writeUInt8(protocol.codes['suback'] << protocol.CMD_SHIFT, pos++);
+  buffer.writeUInt8(protocol.codes['suback'] << protocol.CMD_SHIFT, pos++, true);
 
   // Length
   pos += writeLength(buffer, pos, length);
@@ -1748,7 +1915,7 @@ function suback(opts) {
 
   // Subscriptions
   for (var i = 0; i < granted.length; i++) {
-    buffer.writeUInt8(granted[i], pos++);
+    buffer.writeUInt8(granted[i], pos++, true);
   }
 
   return buffer;
@@ -1851,7 +2018,7 @@ function writeLength(buffer, pos, length) {
     if (length > 0) {
         digit = digit | 0x80
     }
-    buffer.writeUInt8(digit, pos++)
+    buffer.writeUInt8(digit, pos++, true)
   } while (length > 0)
 
   return pos - origPos
@@ -1908,8 +2075,8 @@ function writeBuffer(buffer, pos, src) {
  * @api private
  */
 function writeNumber(buffer, pos, number) {
-  buffer.writeUInt8(number >> 8, pos)
-  buffer.writeUInt8(number & 0x00FF, pos + 1)
+  buffer.writeUInt8(number >> 8, pos, true)
+  buffer.writeUInt8(number & 0x00FF, pos + 1, true)
 
   return 2
 }
@@ -1937,10 +2104,18 @@ function writeStringOrBuffer(buffer, pos, toWrite) {
   return written
 }
 
+function byteLength(bufOrString) {
+  if (Buffer.isBuffer(bufOrString)) {
+    return bufOrString.length
+  } else {
+    return Buffer.byteLength(bufOrString)
+  }
+}
+
 module.exports = generate
 
 }).call(this,require("buffer").Buffer)
-},{"./constants":11,"buffer":37}],13:[function(require,module,exports){
+},{"./constants":11,"buffer":58}],13:[function(require,module,exports){
 
 'use strict';
 
@@ -2167,7 +2342,7 @@ BufferList.prototype.destroy = function () {
 module.exports = BufferList
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":37,"readable-stream/duplex":17,"util":64}],15:[function(require,module,exports){
+},{"buffer":58,"readable-stream/duplex":17,"util":85}],15:[function(require,module,exports){
 
 function Packet() {
   this.cmd = null
@@ -2553,7 +2728,7 @@ Parser.prototype._parseNum = function() {
 
 module.exports = Parser
 
-},{"./constants":11,"./packet":15,"bl":14,"events":41,"inherits":10}],17:[function(require,module,exports){
+},{"./constants":11,"./packet":15,"bl":14,"events":62,"inherits":10}],17:[function(require,module,exports){
 module.exports = require("./lib/_stream_duplex.js")
 
 },{"./lib/_stream_duplex.js":18}],18:[function(require,module,exports){
@@ -2649,7 +2824,7 @@ function forEach (xs, f) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_readable":20,"./_stream_writable":22,"_process":44,"core-util-is":23,"inherits":10}],19:[function(require,module,exports){
+},{"./_stream_readable":20,"./_stream_writable":22,"_process":65,"core-util-is":23,"inherits":10}],19:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -3683,7 +3858,7 @@ function indexOf (xs, x) {
 }
 
 }).call(this,require('_process'))
-},{"_process":44,"buffer":37,"core-util-is":23,"events":41,"inherits":10,"isarray":24,"stream":60,"string_decoder/":25}],21:[function(require,module,exports){
+},{"_process":65,"buffer":58,"core-util-is":23,"events":62,"inherits":10,"isarray":24,"stream":81,"string_decoder/":25}],21:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -4285,7 +4460,7 @@ function endWritable(stream, state, cb) {
 }
 
 }).call(this,require('_process'))
-},{"./_stream_duplex":18,"_process":44,"buffer":37,"core-util-is":23,"inherits":10,"stream":60}],23:[function(require,module,exports){
+},{"./_stream_duplex":18,"_process":65,"buffer":58,"core-util-is":23,"inherits":10,"stream":81}],23:[function(require,module,exports){
 (function (Buffer){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -4310,8 +4485,12 @@ function endWritable(stream, state, cb) {
 
 // NOTE: These type checking functions intentionally don't use `instanceof`
 // because it is fragile and can be easily faked with `Object.create()`.
-function isArray(ar) {
-  return Array.isArray(ar);
+
+function isArray(arg) {
+  if (Array.isArray) {
+    return Array.isArray(arg);
+  }
+  return objectToString(arg) === '[object Array]';
 }
 exports.isArray = isArray;
 
@@ -4351,7 +4530,7 @@ function isUndefined(arg) {
 exports.isUndefined = isUndefined;
 
 function isRegExp(re) {
-  return isObject(re) && objectToString(re) === '[object RegExp]';
+  return objectToString(re) === '[object RegExp]';
 }
 exports.isRegExp = isRegExp;
 
@@ -4361,13 +4540,12 @@ function isObject(arg) {
 exports.isObject = isObject;
 
 function isDate(d) {
-  return isObject(d) && objectToString(d) === '[object Date]';
+  return objectToString(d) === '[object Date]';
 }
 exports.isDate = isDate;
 
 function isError(e) {
-  return isObject(e) &&
-      (objectToString(e) === '[object Error]' || e instanceof Error);
+  return (objectToString(e) === '[object Error]' || e instanceof Error);
 }
 exports.isError = isError;
 
@@ -4386,16 +4564,14 @@ function isPrimitive(arg) {
 }
 exports.isPrimitive = isPrimitive;
 
-function isBuffer(arg) {
-  return Buffer.isBuffer(arg);
-}
-exports.isBuffer = isBuffer;
+exports.isBuffer = Buffer.isBuffer;
 
 function objectToString(o) {
   return Object.prototype.toString.call(o);
 }
+
 }).call(this,require("buffer").Buffer)
-},{"buffer":37}],24:[function(require,module,exports){
+},{"buffer":58}],24:[function(require,module,exports){
 module.exports = Array.isArray || function (arr) {
   return Object.prototype.toString.call(arr) == '[object Array]';
 };
@@ -4623,7 +4799,7 @@ function base64DetectIncompleteChar(buffer) {
   this.charLength = this.charReceived ? 3 : 0;
 }
 
-},{"buffer":37}],26:[function(require,module,exports){
+},{"buffer":58}],26:[function(require,module,exports){
 var Stream = require('stream'); // hack to fix a circular dependency issue when used with browserify
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = Stream;
@@ -4633,10 +4809,57 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":18,"./lib/_stream_passthrough.js":19,"./lib/_stream_readable.js":20,"./lib/_stream_transform.js":21,"./lib/_stream_writable.js":22,"stream":60}],27:[function(require,module,exports){
-module.exports = require("./lib/_stream_transform.js")
+},{"./lib/_stream_duplex.js":18,"./lib/_stream_passthrough.js":19,"./lib/_stream_readable.js":20,"./lib/_stream_transform.js":21,"./lib/_stream_writable.js":22,"stream":81}],27:[function(require,module,exports){
+'use strict'
 
-},{"./lib/_stream_transform.js":21}],28:[function(require,module,exports){
+function ReInterval (callback, interval, args) {
+  var self = this;
+
+  this._callback = callback;
+  this._args = args;
+
+  this._interval = setInterval(callback, interval, this._args);
+
+  this.reschedule = function (interval) {
+
+    var now = Date.now();
+    if (self._interval)
+      clearInterval(self._interval);
+    self._interval = setInterval(self._callback, interval, self._args);
+  };
+
+  this.clear = function () {
+    if (self._interval) {
+      clearInterval(self._interval);
+      self._interval = undefined;
+      self._callback = undefined;
+      self._args = undefined;
+    }
+  };
+}
+
+function reInterval () {
+  if (typeof arguments[0] !== 'function')
+    throw new Error('callback needed');
+  if (typeof arguments[1] !== 'number')
+    throw new Error('interval needed');
+
+  var args;
+
+  if (arguments.length > 0) {
+    args = new Array(arguments.length - 2);
+
+    for (var i = 0; i < args.length; i++) {
+      args[i] = arguments[i + 2];
+    }
+  }
+
+  return new ReInterval(arguments[0], arguments[1], args);
+}
+
+module.exports = reInterval;
+
+},{}],28:[function(require,module,exports){
 (function (process,Buffer){
 var stream = require('readable-stream')
 var eos = require('end-of-stream')
@@ -4677,6 +4900,7 @@ var Duplexify = function(writable, readable, opts) {
   this._readable2 = null
 
   this._forwardDestroy = !opts || opts.destroy !== false
+  this._forwardEnd = !opts || opts.end !== false
   this._corked = 1 // start corked
   this._ondrain = null
   this._drained = false
@@ -4722,7 +4946,7 @@ Duplexify.prototype.setWritable = function(writable) {
   }
 
   var self = this
-  var unend = eos(writable, {writable:true, readable:false}, destroyer(this, true))
+  var unend = eos(writable, {writable:true, readable:false}, destroyer(this, this._forwardEnd))
 
   var ondrain = function() {
     var ondrain = self._ondrain
@@ -4795,7 +5019,9 @@ Duplexify.prototype._forward = function() {
   this._forwarding = true
 
   var data
-  while ((data = this._readable2.read()) !== null) {
+  var state = this._readable2._readableState
+
+  while ((data = this._readable2.read(state.buffer.length ? state.buffer[0].length : state.length)) !== null) {
     this._drained = this.push(data)
   }
 
@@ -4843,7 +5069,9 @@ Duplexify.prototype._finish = function(cb) {
   var self = this
   this.emit('preend')
   onuncork(this, function() {
-    end(self._writable, function() {
+    end(self._forwardEnd && self._writable, function() {
+      // haxx to not emit prefinish twice
+      if (self._writableState.prefinished === false) self._writableState.prefinished = true
       self.emit('prefinish')
       onuncork(self, cb)
     })
@@ -4861,7 +5089,7 @@ Duplexify.prototype.end = function(data, enc, cb) {
 
 module.exports = Duplexify
 }).call(this,require('_process'),require("buffer").Buffer)
-},{"_process":44,"buffer":37,"end-of-stream":29,"readable-stream":26,"util":64}],29:[function(require,module,exports){
+},{"_process":65,"buffer":58,"end-of-stream":29,"readable-stream":42,"util":85}],29:[function(require,module,exports){
 var once = require('once');
 
 var noop = function() {};
@@ -4939,6 +5167,1960 @@ arguments[4][8][0].apply(exports,arguments)
 },{"dup":8}],31:[function(require,module,exports){
 arguments[4][9][0].apply(exports,arguments)
 },{"dup":9,"wrappy":30}],32:[function(require,module,exports){
+// a duplex stream is just a stream that is both readable and writable.
+// Since JS doesn't have multiple prototypal inheritance, this class
+// prototypally inherits from Readable, and then parasitically from
+// Writable.
+
+'use strict';
+
+/*<replacement>*/
+var objectKeys = Object.keys || function (obj) {
+  var keys = [];
+  for (var key in obj) keys.push(key);
+  return keys;
+}
+/*</replacement>*/
+
+
+module.exports = Duplex;
+
+/*<replacement>*/
+var processNextTick = require('process-nextick-args');
+/*</replacement>*/
+
+
+
+/*<replacement>*/
+var util = require('core-util-is');
+util.inherits = require('inherits');
+/*</replacement>*/
+
+var Readable = require('./_stream_readable');
+var Writable = require('./_stream_writable');
+
+util.inherits(Duplex, Readable);
+
+var keys = objectKeys(Writable.prototype);
+for (var v = 0; v < keys.length; v++) {
+  var method = keys[v];
+  if (!Duplex.prototype[method])
+    Duplex.prototype[method] = Writable.prototype[method];
+}
+
+function Duplex(options) {
+  if (!(this instanceof Duplex))
+    return new Duplex(options);
+
+  Readable.call(this, options);
+  Writable.call(this, options);
+
+  if (options && options.readable === false)
+    this.readable = false;
+
+  if (options && options.writable === false)
+    this.writable = false;
+
+  this.allowHalfOpen = true;
+  if (options && options.allowHalfOpen === false)
+    this.allowHalfOpen = false;
+
+  this.once('end', onend);
+}
+
+// the no-half-open enforcer
+function onend() {
+  // if we allow half-open state, or if the writable side ended,
+  // then we're ok.
+  if (this.allowHalfOpen || this._writableState.ended)
+    return;
+
+  // no more data can be written.
+  // But allow more writes to happen in this tick.
+  processNextTick(onEndNT, this);
+}
+
+function onEndNT(self) {
+  self.end();
+}
+
+function forEach (xs, f) {
+  for (var i = 0, l = xs.length; i < l; i++) {
+    f(xs[i], i);
+  }
+}
+
+},{"./_stream_readable":34,"./_stream_writable":36,"core-util-is":37,"inherits":10,"process-nextick-args":39}],33:[function(require,module,exports){
+// a passthrough stream.
+// basically just the most minimal sort of Transform stream.
+// Every written chunk gets output as-is.
+
+'use strict';
+
+module.exports = PassThrough;
+
+var Transform = require('./_stream_transform');
+
+/*<replacement>*/
+var util = require('core-util-is');
+util.inherits = require('inherits');
+/*</replacement>*/
+
+util.inherits(PassThrough, Transform);
+
+function PassThrough(options) {
+  if (!(this instanceof PassThrough))
+    return new PassThrough(options);
+
+  Transform.call(this, options);
+}
+
+PassThrough.prototype._transform = function(chunk, encoding, cb) {
+  cb(null, chunk);
+};
+
+},{"./_stream_transform":35,"core-util-is":37,"inherits":10}],34:[function(require,module,exports){
+(function (process){
+'use strict';
+
+module.exports = Readable;
+
+/*<replacement>*/
+var processNextTick = require('process-nextick-args');
+/*</replacement>*/
+
+
+/*<replacement>*/
+var isArray = require('isarray');
+/*</replacement>*/
+
+
+/*<replacement>*/
+var Buffer = require('buffer').Buffer;
+/*</replacement>*/
+
+Readable.ReadableState = ReadableState;
+
+var EE = require('events');
+
+/*<replacement>*/
+var EElistenerCount = function(emitter, type) {
+  return emitter.listeners(type).length;
+};
+/*</replacement>*/
+
+
+
+/*<replacement>*/
+var Stream;
+(function (){try{
+  Stream = require('st' + 'ream');
+}catch(_){}finally{
+  if (!Stream)
+    Stream = require('events').EventEmitter;
+}}())
+/*</replacement>*/
+
+var Buffer = require('buffer').Buffer;
+
+/*<replacement>*/
+var util = require('core-util-is');
+util.inherits = require('inherits');
+/*</replacement>*/
+
+
+
+/*<replacement>*/
+var debugUtil = require('util');
+var debug;
+if (debugUtil && debugUtil.debuglog) {
+  debug = debugUtil.debuglog('stream');
+} else {
+  debug = function () {};
+}
+/*</replacement>*/
+
+var StringDecoder;
+
+util.inherits(Readable, Stream);
+
+function ReadableState(options, stream) {
+  var Duplex = require('./_stream_duplex');
+
+  options = options || {};
+
+  // object stream flag. Used to make read(n) ignore n and to
+  // make all the buffer merging and length checks go away
+  this.objectMode = !!options.objectMode;
+
+  if (stream instanceof Duplex)
+    this.objectMode = this.objectMode || !!options.readableObjectMode;
+
+  // the point at which it stops calling _read() to fill the buffer
+  // Note: 0 is a valid value, means "don't call _read preemptively ever"
+  var hwm = options.highWaterMark;
+  var defaultHwm = this.objectMode ? 16 : 16 * 1024;
+  this.highWaterMark = (hwm || hwm === 0) ? hwm : defaultHwm;
+
+  // cast to ints.
+  this.highWaterMark = ~~this.highWaterMark;
+
+  this.buffer = [];
+  this.length = 0;
+  this.pipes = null;
+  this.pipesCount = 0;
+  this.flowing = null;
+  this.ended = false;
+  this.endEmitted = false;
+  this.reading = false;
+
+  // a flag to be able to tell if the onwrite cb is called immediately,
+  // or on a later tick.  We set this to true at first, because any
+  // actions that shouldn't happen until "later" should generally also
+  // not happen before the first write call.
+  this.sync = true;
+
+  // whenever we return null, then we set a flag to say
+  // that we're awaiting a 'readable' event emission.
+  this.needReadable = false;
+  this.emittedReadable = false;
+  this.readableListening = false;
+
+  // Crypto is kind of old and crusty.  Historically, its default string
+  // encoding is 'binary' so we have to make this configurable.
+  // Everything else in the universe uses 'utf8', though.
+  this.defaultEncoding = options.defaultEncoding || 'utf8';
+
+  // when piping, we only care about 'readable' events that happen
+  // after read()ing all the bytes and not getting any pushback.
+  this.ranOut = false;
+
+  // the number of writers that are awaiting a drain event in .pipe()s
+  this.awaitDrain = 0;
+
+  // if true, a maybeReadMore has been scheduled
+  this.readingMore = false;
+
+  this.decoder = null;
+  this.encoding = null;
+  if (options.encoding) {
+    if (!StringDecoder)
+      StringDecoder = require('string_decoder/').StringDecoder;
+    this.decoder = new StringDecoder(options.encoding);
+    this.encoding = options.encoding;
+  }
+}
+
+function Readable(options) {
+  var Duplex = require('./_stream_duplex');
+
+  if (!(this instanceof Readable))
+    return new Readable(options);
+
+  this._readableState = new ReadableState(options, this);
+
+  // legacy
+  this.readable = true;
+
+  if (options && typeof options.read === 'function')
+    this._read = options.read;
+
+  Stream.call(this);
+}
+
+// Manually shove something into the read() buffer.
+// This returns true if the highWaterMark has not been hit yet,
+// similar to how Writable.write() returns true if you should
+// write() some more.
+Readable.prototype.push = function(chunk, encoding) {
+  var state = this._readableState;
+
+  if (!state.objectMode && typeof chunk === 'string') {
+    encoding = encoding || state.defaultEncoding;
+    if (encoding !== state.encoding) {
+      chunk = new Buffer(chunk, encoding);
+      encoding = '';
+    }
+  }
+
+  return readableAddChunk(this, state, chunk, encoding, false);
+};
+
+// Unshift should *always* be something directly out of read()
+Readable.prototype.unshift = function(chunk) {
+  var state = this._readableState;
+  return readableAddChunk(this, state, chunk, '', true);
+};
+
+Readable.prototype.isPaused = function() {
+  return this._readableState.flowing === false;
+};
+
+function readableAddChunk(stream, state, chunk, encoding, addToFront) {
+  var er = chunkInvalid(state, chunk);
+  if (er) {
+    stream.emit('error', er);
+  } else if (chunk === null) {
+    state.reading = false;
+    onEofChunk(stream, state);
+  } else if (state.objectMode || chunk && chunk.length > 0) {
+    if (state.ended && !addToFront) {
+      var e = new Error('stream.push() after EOF');
+      stream.emit('error', e);
+    } else if (state.endEmitted && addToFront) {
+      var e = new Error('stream.unshift() after end event');
+      stream.emit('error', e);
+    } else {
+      if (state.decoder && !addToFront && !encoding)
+        chunk = state.decoder.write(chunk);
+
+      if (!addToFront)
+        state.reading = false;
+
+      // if we want the data now, just emit it.
+      if (state.flowing && state.length === 0 && !state.sync) {
+        stream.emit('data', chunk);
+        stream.read(0);
+      } else {
+        // update the buffer info.
+        state.length += state.objectMode ? 1 : chunk.length;
+        if (addToFront)
+          state.buffer.unshift(chunk);
+        else
+          state.buffer.push(chunk);
+
+        if (state.needReadable)
+          emitReadable(stream);
+      }
+
+      maybeReadMore(stream, state);
+    }
+  } else if (!addToFront) {
+    state.reading = false;
+  }
+
+  return needMoreData(state);
+}
+
+
+// if it's past the high water mark, we can push in some more.
+// Also, if we have no data yet, we can stand some
+// more bytes.  This is to work around cases where hwm=0,
+// such as the repl.  Also, if the push() triggered a
+// readable event, and the user called read(largeNumber) such that
+// needReadable was set, then we ought to push more, so that another
+// 'readable' event will be triggered.
+function needMoreData(state) {
+  return !state.ended &&
+         (state.needReadable ||
+          state.length < state.highWaterMark ||
+          state.length === 0);
+}
+
+// backwards compatibility.
+Readable.prototype.setEncoding = function(enc) {
+  if (!StringDecoder)
+    StringDecoder = require('string_decoder/').StringDecoder;
+  this._readableState.decoder = new StringDecoder(enc);
+  this._readableState.encoding = enc;
+  return this;
+};
+
+// Don't raise the hwm > 8MB
+var MAX_HWM = 0x800000;
+function computeNewHighWaterMark(n) {
+  if (n >= MAX_HWM) {
+    n = MAX_HWM;
+  } else {
+    // Get the next highest power of 2
+    n--;
+    n |= n >>> 1;
+    n |= n >>> 2;
+    n |= n >>> 4;
+    n |= n >>> 8;
+    n |= n >>> 16;
+    n++;
+  }
+  return n;
+}
+
+function howMuchToRead(n, state) {
+  if (state.length === 0 && state.ended)
+    return 0;
+
+  if (state.objectMode)
+    return n === 0 ? 0 : 1;
+
+  if (n === null || isNaN(n)) {
+    // only flow one buffer at a time
+    if (state.flowing && state.buffer.length)
+      return state.buffer[0].length;
+    else
+      return state.length;
+  }
+
+  if (n <= 0)
+    return 0;
+
+  // If we're asking for more than the target buffer level,
+  // then raise the water mark.  Bump up to the next highest
+  // power of 2, to prevent increasing it excessively in tiny
+  // amounts.
+  if (n > state.highWaterMark)
+    state.highWaterMark = computeNewHighWaterMark(n);
+
+  // don't have that much.  return null, unless we've ended.
+  if (n > state.length) {
+    if (!state.ended) {
+      state.needReadable = true;
+      return 0;
+    } else {
+      return state.length;
+    }
+  }
+
+  return n;
+}
+
+// you can override either this method, or the async _read(n) below.
+Readable.prototype.read = function(n) {
+  debug('read', n);
+  var state = this._readableState;
+  var nOrig = n;
+
+  if (typeof n !== 'number' || n > 0)
+    state.emittedReadable = false;
+
+  // if we're doing read(0) to trigger a readable event, but we
+  // already have a bunch of data in the buffer, then just trigger
+  // the 'readable' event and move on.
+  if (n === 0 &&
+      state.needReadable &&
+      (state.length >= state.highWaterMark || state.ended)) {
+    debug('read: emitReadable', state.length, state.ended);
+    if (state.length === 0 && state.ended)
+      endReadable(this);
+    else
+      emitReadable(this);
+    return null;
+  }
+
+  n = howMuchToRead(n, state);
+
+  // if we've ended, and we're now clear, then finish it up.
+  if (n === 0 && state.ended) {
+    if (state.length === 0)
+      endReadable(this);
+    return null;
+  }
+
+  // All the actual chunk generation logic needs to be
+  // *below* the call to _read.  The reason is that in certain
+  // synthetic stream cases, such as passthrough streams, _read
+  // may be a completely synchronous operation which may change
+  // the state of the read buffer, providing enough data when
+  // before there was *not* enough.
+  //
+  // So, the steps are:
+  // 1. Figure out what the state of things will be after we do
+  // a read from the buffer.
+  //
+  // 2. If that resulting state will trigger a _read, then call _read.
+  // Note that this may be asynchronous, or synchronous.  Yes, it is
+  // deeply ugly to write APIs this way, but that still doesn't mean
+  // that the Readable class should behave improperly, as streams are
+  // designed to be sync/async agnostic.
+  // Take note if the _read call is sync or async (ie, if the read call
+  // has returned yet), so that we know whether or not it's safe to emit
+  // 'readable' etc.
+  //
+  // 3. Actually pull the requested chunks out of the buffer and return.
+
+  // if we need a readable event, then we need to do some reading.
+  var doRead = state.needReadable;
+  debug('need readable', doRead);
+
+  // if we currently have less than the highWaterMark, then also read some
+  if (state.length === 0 || state.length - n < state.highWaterMark) {
+    doRead = true;
+    debug('length less than watermark', doRead);
+  }
+
+  // however, if we've ended, then there's no point, and if we're already
+  // reading, then it's unnecessary.
+  if (state.ended || state.reading) {
+    doRead = false;
+    debug('reading or ended', doRead);
+  }
+
+  if (doRead) {
+    debug('do read');
+    state.reading = true;
+    state.sync = true;
+    // if the length is currently zero, then we *need* a readable event.
+    if (state.length === 0)
+      state.needReadable = true;
+    // call internal read method
+    this._read(state.highWaterMark);
+    state.sync = false;
+  }
+
+  // If _read pushed data synchronously, then `reading` will be false,
+  // and we need to re-evaluate how much data we can return to the user.
+  if (doRead && !state.reading)
+    n = howMuchToRead(nOrig, state);
+
+  var ret;
+  if (n > 0)
+    ret = fromList(n, state);
+  else
+    ret = null;
+
+  if (ret === null) {
+    state.needReadable = true;
+    n = 0;
+  }
+
+  state.length -= n;
+
+  // If we have nothing in the buffer, then we want to know
+  // as soon as we *do* get something into the buffer.
+  if (state.length === 0 && !state.ended)
+    state.needReadable = true;
+
+  // If we tried to read() past the EOF, then emit end on the next tick.
+  if (nOrig !== n && state.ended && state.length === 0)
+    endReadable(this);
+
+  if (ret !== null)
+    this.emit('data', ret);
+
+  return ret;
+};
+
+function chunkInvalid(state, chunk) {
+  var er = null;
+  if (!(Buffer.isBuffer(chunk)) &&
+      typeof chunk !== 'string' &&
+      chunk !== null &&
+      chunk !== undefined &&
+      !state.objectMode) {
+    er = new TypeError('Invalid non-string/buffer chunk');
+  }
+  return er;
+}
+
+
+function onEofChunk(stream, state) {
+  if (state.ended) return;
+  if (state.decoder) {
+    var chunk = state.decoder.end();
+    if (chunk && chunk.length) {
+      state.buffer.push(chunk);
+      state.length += state.objectMode ? 1 : chunk.length;
+    }
+  }
+  state.ended = true;
+
+  // emit 'readable' now to make sure it gets picked up.
+  emitReadable(stream);
+}
+
+// Don't emit readable right away in sync mode, because this can trigger
+// another read() call => stack overflow.  This way, it might trigger
+// a nextTick recursion warning, but that's not so bad.
+function emitReadable(stream) {
+  var state = stream._readableState;
+  state.needReadable = false;
+  if (!state.emittedReadable) {
+    debug('emitReadable', state.flowing);
+    state.emittedReadable = true;
+    if (state.sync)
+      processNextTick(emitReadable_, stream);
+    else
+      emitReadable_(stream);
+  }
+}
+
+function emitReadable_(stream) {
+  debug('emit readable');
+  stream.emit('readable');
+  flow(stream);
+}
+
+
+// at this point, the user has presumably seen the 'readable' event,
+// and called read() to consume some data.  that may have triggered
+// in turn another _read(n) call, in which case reading = true if
+// it's in progress.
+// However, if we're not ended, or reading, and the length < hwm,
+// then go ahead and try to read some more preemptively.
+function maybeReadMore(stream, state) {
+  if (!state.readingMore) {
+    state.readingMore = true;
+    processNextTick(maybeReadMore_, stream, state);
+  }
+}
+
+function maybeReadMore_(stream, state) {
+  var len = state.length;
+  while (!state.reading && !state.flowing && !state.ended &&
+         state.length < state.highWaterMark) {
+    debug('maybeReadMore read 0');
+    stream.read(0);
+    if (len === state.length)
+      // didn't get any data, stop spinning.
+      break;
+    else
+      len = state.length;
+  }
+  state.readingMore = false;
+}
+
+// abstract method.  to be overridden in specific implementation classes.
+// call cb(er, data) where data is <= n in length.
+// for virtual (non-string, non-buffer) streams, "length" is somewhat
+// arbitrary, and perhaps not very meaningful.
+Readable.prototype._read = function(n) {
+  this.emit('error', new Error('not implemented'));
+};
+
+Readable.prototype.pipe = function(dest, pipeOpts) {
+  var src = this;
+  var state = this._readableState;
+
+  switch (state.pipesCount) {
+    case 0:
+      state.pipes = dest;
+      break;
+    case 1:
+      state.pipes = [state.pipes, dest];
+      break;
+    default:
+      state.pipes.push(dest);
+      break;
+  }
+  state.pipesCount += 1;
+  debug('pipe count=%d opts=%j', state.pipesCount, pipeOpts);
+
+  var doEnd = (!pipeOpts || pipeOpts.end !== false) &&
+              dest !== process.stdout &&
+              dest !== process.stderr;
+
+  var endFn = doEnd ? onend : cleanup;
+  if (state.endEmitted)
+    processNextTick(endFn);
+  else
+    src.once('end', endFn);
+
+  dest.on('unpipe', onunpipe);
+  function onunpipe(readable) {
+    debug('onunpipe');
+    if (readable === src) {
+      cleanup();
+    }
+  }
+
+  function onend() {
+    debug('onend');
+    dest.end();
+  }
+
+  // when the dest drains, it reduces the awaitDrain counter
+  // on the source.  This would be more elegant with a .once()
+  // handler in flow(), but adding and removing repeatedly is
+  // too slow.
+  var ondrain = pipeOnDrain(src);
+  dest.on('drain', ondrain);
+
+  var cleanedUp = false;
+  function cleanup() {
+    debug('cleanup');
+    // cleanup event handlers once the pipe is broken
+    dest.removeListener('close', onclose);
+    dest.removeListener('finish', onfinish);
+    dest.removeListener('drain', ondrain);
+    dest.removeListener('error', onerror);
+    dest.removeListener('unpipe', onunpipe);
+    src.removeListener('end', onend);
+    src.removeListener('end', cleanup);
+    src.removeListener('data', ondata);
+
+    cleanedUp = true;
+
+    // if the reader is waiting for a drain event from this
+    // specific writer, then it would cause it to never start
+    // flowing again.
+    // So, if this is awaiting a drain, then we just call it now.
+    // If we don't know, then assume that we are waiting for one.
+    if (state.awaitDrain &&
+        (!dest._writableState || dest._writableState.needDrain))
+      ondrain();
+  }
+
+  src.on('data', ondata);
+  function ondata(chunk) {
+    debug('ondata');
+    var ret = dest.write(chunk);
+    if (false === ret) {
+      // If the user unpiped during `dest.write()`, it is possible
+      // to get stuck in a permanently paused state if that write
+      // also returned false.
+      if (state.pipesCount === 1 &&
+          state.pipes[0] === dest &&
+          src.listenerCount('data') === 1 &&
+          !cleanedUp) {
+        debug('false write response, pause', src._readableState.awaitDrain);
+        src._readableState.awaitDrain++;
+      }
+      src.pause();
+    }
+  }
+
+  // if the dest has an error, then stop piping into it.
+  // however, don't suppress the throwing behavior for this.
+  function onerror(er) {
+    debug('onerror', er);
+    unpipe();
+    dest.removeListener('error', onerror);
+    if (EElistenerCount(dest, 'error') === 0)
+      dest.emit('error', er);
+  }
+  // This is a brutally ugly hack to make sure that our error handler
+  // is attached before any userland ones.  NEVER DO THIS.
+  if (!dest._events || !dest._events.error)
+    dest.on('error', onerror);
+  else if (isArray(dest._events.error))
+    dest._events.error.unshift(onerror);
+  else
+    dest._events.error = [onerror, dest._events.error];
+
+
+  // Both close and finish should trigger unpipe, but only once.
+  function onclose() {
+    dest.removeListener('finish', onfinish);
+    unpipe();
+  }
+  dest.once('close', onclose);
+  function onfinish() {
+    debug('onfinish');
+    dest.removeListener('close', onclose);
+    unpipe();
+  }
+  dest.once('finish', onfinish);
+
+  function unpipe() {
+    debug('unpipe');
+    src.unpipe(dest);
+  }
+
+  // tell the dest that it's being piped to
+  dest.emit('pipe', src);
+
+  // start the flow if it hasn't been started already.
+  if (!state.flowing) {
+    debug('pipe resume');
+    src.resume();
+  }
+
+  return dest;
+};
+
+function pipeOnDrain(src) {
+  return function() {
+    var state = src._readableState;
+    debug('pipeOnDrain', state.awaitDrain);
+    if (state.awaitDrain)
+      state.awaitDrain--;
+    if (state.awaitDrain === 0 && EElistenerCount(src, 'data')) {
+      state.flowing = true;
+      flow(src);
+    }
+  };
+}
+
+
+Readable.prototype.unpipe = function(dest) {
+  var state = this._readableState;
+
+  // if we're not piping anywhere, then do nothing.
+  if (state.pipesCount === 0)
+    return this;
+
+  // just one destination.  most common case.
+  if (state.pipesCount === 1) {
+    // passed in one, but it's not the right one.
+    if (dest && dest !== state.pipes)
+      return this;
+
+    if (!dest)
+      dest = state.pipes;
+
+    // got a match.
+    state.pipes = null;
+    state.pipesCount = 0;
+    state.flowing = false;
+    if (dest)
+      dest.emit('unpipe', this);
+    return this;
+  }
+
+  // slow case. multiple pipe destinations.
+
+  if (!dest) {
+    // remove all.
+    var dests = state.pipes;
+    var len = state.pipesCount;
+    state.pipes = null;
+    state.pipesCount = 0;
+    state.flowing = false;
+
+    for (var i = 0; i < len; i++)
+      dests[i].emit('unpipe', this);
+    return this;
+  }
+
+  // try to find the right one.
+  var i = indexOf(state.pipes, dest);
+  if (i === -1)
+    return this;
+
+  state.pipes.splice(i, 1);
+  state.pipesCount -= 1;
+  if (state.pipesCount === 1)
+    state.pipes = state.pipes[0];
+
+  dest.emit('unpipe', this);
+
+  return this;
+};
+
+// set up data events if they are asked for
+// Ensure readable listeners eventually get something
+Readable.prototype.on = function(ev, fn) {
+  var res = Stream.prototype.on.call(this, ev, fn);
+
+  // If listening to data, and it has not explicitly been paused,
+  // then call resume to start the flow of data on the next tick.
+  if (ev === 'data' && false !== this._readableState.flowing) {
+    this.resume();
+  }
+
+  if (ev === 'readable' && this.readable) {
+    var state = this._readableState;
+    if (!state.readableListening) {
+      state.readableListening = true;
+      state.emittedReadable = false;
+      state.needReadable = true;
+      if (!state.reading) {
+        processNextTick(nReadingNextTick, this);
+      } else if (state.length) {
+        emitReadable(this, state);
+      }
+    }
+  }
+
+  return res;
+};
+Readable.prototype.addListener = Readable.prototype.on;
+
+function nReadingNextTick(self) {
+  debug('readable nexttick read 0');
+  self.read(0);
+}
+
+// pause() and resume() are remnants of the legacy readable stream API
+// If the user uses them, then switch into old mode.
+Readable.prototype.resume = function() {
+  var state = this._readableState;
+  if (!state.flowing) {
+    debug('resume');
+    state.flowing = true;
+    resume(this, state);
+  }
+  return this;
+};
+
+function resume(stream, state) {
+  if (!state.resumeScheduled) {
+    state.resumeScheduled = true;
+    processNextTick(resume_, stream, state);
+  }
+}
+
+function resume_(stream, state) {
+  if (!state.reading) {
+    debug('resume read 0');
+    stream.read(0);
+  }
+
+  state.resumeScheduled = false;
+  stream.emit('resume');
+  flow(stream);
+  if (state.flowing && !state.reading)
+    stream.read(0);
+}
+
+Readable.prototype.pause = function() {
+  debug('call pause flowing=%j', this._readableState.flowing);
+  if (false !== this._readableState.flowing) {
+    debug('pause');
+    this._readableState.flowing = false;
+    this.emit('pause');
+  }
+  return this;
+};
+
+function flow(stream) {
+  var state = stream._readableState;
+  debug('flow', state.flowing);
+  if (state.flowing) {
+    do {
+      var chunk = stream.read();
+    } while (null !== chunk && state.flowing);
+  }
+}
+
+// wrap an old-style stream as the async data source.
+// This is *not* part of the readable stream interface.
+// It is an ugly unfortunate mess of history.
+Readable.prototype.wrap = function(stream) {
+  var state = this._readableState;
+  var paused = false;
+
+  var self = this;
+  stream.on('end', function() {
+    debug('wrapped end');
+    if (state.decoder && !state.ended) {
+      var chunk = state.decoder.end();
+      if (chunk && chunk.length)
+        self.push(chunk);
+    }
+
+    self.push(null);
+  });
+
+  stream.on('data', function(chunk) {
+    debug('wrapped data');
+    if (state.decoder)
+      chunk = state.decoder.write(chunk);
+
+    // don't skip over falsy values in objectMode
+    if (state.objectMode && (chunk === null || chunk === undefined))
+      return;
+    else if (!state.objectMode && (!chunk || !chunk.length))
+      return;
+
+    var ret = self.push(chunk);
+    if (!ret) {
+      paused = true;
+      stream.pause();
+    }
+  });
+
+  // proxy all the other methods.
+  // important when wrapping filters and duplexes.
+  for (var i in stream) {
+    if (this[i] === undefined && typeof stream[i] === 'function') {
+      this[i] = function(method) { return function() {
+        return stream[method].apply(stream, arguments);
+      }; }(i);
+    }
+  }
+
+  // proxy certain important events.
+  var events = ['error', 'close', 'destroy', 'pause', 'resume'];
+  forEach(events, function(ev) {
+    stream.on(ev, self.emit.bind(self, ev));
+  });
+
+  // when we try to consume some more bytes, simply unpause the
+  // underlying stream.
+  self._read = function(n) {
+    debug('wrapped _read', n);
+    if (paused) {
+      paused = false;
+      stream.resume();
+    }
+  };
+
+  return self;
+};
+
+
+// exposed for testing purposes only.
+Readable._fromList = fromList;
+
+// Pluck off n bytes from an array of buffers.
+// Length is the combined lengths of all the buffers in the list.
+function fromList(n, state) {
+  var list = state.buffer;
+  var length = state.length;
+  var stringMode = !!state.decoder;
+  var objectMode = !!state.objectMode;
+  var ret;
+
+  // nothing in the list, definitely empty.
+  if (list.length === 0)
+    return null;
+
+  if (length === 0)
+    ret = null;
+  else if (objectMode)
+    ret = list.shift();
+  else if (!n || n >= length) {
+    // read it all, truncate the array.
+    if (stringMode)
+      ret = list.join('');
+    else if (list.length === 1)
+      ret = list[0];
+    else
+      ret = Buffer.concat(list, length);
+    list.length = 0;
+  } else {
+    // read just some of it.
+    if (n < list[0].length) {
+      // just take a part of the first list item.
+      // slice is the same for buffers and strings.
+      var buf = list[0];
+      ret = buf.slice(0, n);
+      list[0] = buf.slice(n);
+    } else if (n === list[0].length) {
+      // first list is a perfect match
+      ret = list.shift();
+    } else {
+      // complex case.
+      // we have enough to cover it, but it spans past the first buffer.
+      if (stringMode)
+        ret = '';
+      else
+        ret = new Buffer(n);
+
+      var c = 0;
+      for (var i = 0, l = list.length; i < l && c < n; i++) {
+        var buf = list[0];
+        var cpy = Math.min(n - c, buf.length);
+
+        if (stringMode)
+          ret += buf.slice(0, cpy);
+        else
+          buf.copy(ret, c, 0, cpy);
+
+        if (cpy < buf.length)
+          list[0] = buf.slice(cpy);
+        else
+          list.shift();
+
+        c += cpy;
+      }
+    }
+  }
+
+  return ret;
+}
+
+function endReadable(stream) {
+  var state = stream._readableState;
+
+  // If we get here before consuming all the bytes, then that is a
+  // bug in node.  Should never happen.
+  if (state.length > 0)
+    throw new Error('endReadable called on non-empty stream');
+
+  if (!state.endEmitted) {
+    state.ended = true;
+    processNextTick(endReadableNT, state, stream);
+  }
+}
+
+function endReadableNT(state, stream) {
+  // Check that we didn't get one last unshift.
+  if (!state.endEmitted && state.length === 0) {
+    state.endEmitted = true;
+    stream.readable = false;
+    stream.emit('end');
+  }
+}
+
+function forEach (xs, f) {
+  for (var i = 0, l = xs.length; i < l; i++) {
+    f(xs[i], i);
+  }
+}
+
+function indexOf (xs, x) {
+  for (var i = 0, l = xs.length; i < l; i++) {
+    if (xs[i] === x) return i;
+  }
+  return -1;
+}
+
+}).call(this,require('_process'))
+},{"./_stream_duplex":32,"_process":65,"buffer":58,"core-util-is":37,"events":62,"inherits":10,"isarray":38,"process-nextick-args":39,"string_decoder/":40,"util":57}],35:[function(require,module,exports){
+// a transform stream is a readable/writable stream where you do
+// something with the data.  Sometimes it's called a "filter",
+// but that's not a great name for it, since that implies a thing where
+// some bits pass through, and others are simply ignored.  (That would
+// be a valid example of a transform, of course.)
+//
+// While the output is causally related to the input, it's not a
+// necessarily symmetric or synchronous transformation.  For example,
+// a zlib stream might take multiple plain-text writes(), and then
+// emit a single compressed chunk some time in the future.
+//
+// Here's how this works:
+//
+// The Transform stream has all the aspects of the readable and writable
+// stream classes.  When you write(chunk), that calls _write(chunk,cb)
+// internally, and returns false if there's a lot of pending writes
+// buffered up.  When you call read(), that calls _read(n) until
+// there's enough pending readable data buffered up.
+//
+// In a transform stream, the written data is placed in a buffer.  When
+// _read(n) is called, it transforms the queued up data, calling the
+// buffered _write cb's as it consumes chunks.  If consuming a single
+// written chunk would result in multiple output chunks, then the first
+// outputted bit calls the readcb, and subsequent chunks just go into
+// the read buffer, and will cause it to emit 'readable' if necessary.
+//
+// This way, back-pressure is actually determined by the reading side,
+// since _read has to be called to start processing a new chunk.  However,
+// a pathological inflate type of transform can cause excessive buffering
+// here.  For example, imagine a stream where every byte of input is
+// interpreted as an integer from 0-255, and then results in that many
+// bytes of output.  Writing the 4 bytes {ff,ff,ff,ff} would result in
+// 1kb of data being output.  In this case, you could write a very small
+// amount of input, and end up with a very large amount of output.  In
+// such a pathological inflating mechanism, there'd be no way to tell
+// the system to stop doing the transform.  A single 4MB write could
+// cause the system to run out of memory.
+//
+// However, even in such a pathological case, only a single written chunk
+// would be consumed, and then the rest would wait (un-transformed) until
+// the results of the previous transformed chunk were consumed.
+
+'use strict';
+
+module.exports = Transform;
+
+var Duplex = require('./_stream_duplex');
+
+/*<replacement>*/
+var util = require('core-util-is');
+util.inherits = require('inherits');
+/*</replacement>*/
+
+util.inherits(Transform, Duplex);
+
+
+function TransformState(stream) {
+  this.afterTransform = function(er, data) {
+    return afterTransform(stream, er, data);
+  };
+
+  this.needTransform = false;
+  this.transforming = false;
+  this.writecb = null;
+  this.writechunk = null;
+}
+
+function afterTransform(stream, er, data) {
+  var ts = stream._transformState;
+  ts.transforming = false;
+
+  var cb = ts.writecb;
+
+  if (!cb)
+    return stream.emit('error', new Error('no writecb in Transform class'));
+
+  ts.writechunk = null;
+  ts.writecb = null;
+
+  if (data !== null && data !== undefined)
+    stream.push(data);
+
+  if (cb)
+    cb(er);
+
+  var rs = stream._readableState;
+  rs.reading = false;
+  if (rs.needReadable || rs.length < rs.highWaterMark) {
+    stream._read(rs.highWaterMark);
+  }
+}
+
+
+function Transform(options) {
+  if (!(this instanceof Transform))
+    return new Transform(options);
+
+  Duplex.call(this, options);
+
+  this._transformState = new TransformState(this);
+
+  // when the writable side finishes, then flush out anything remaining.
+  var stream = this;
+
+  // start out asking for a readable event once data is transformed.
+  this._readableState.needReadable = true;
+
+  // we have implemented the _read method, and done the other things
+  // that Readable wants before the first _read call, so unset the
+  // sync guard flag.
+  this._readableState.sync = false;
+
+  if (options) {
+    if (typeof options.transform === 'function')
+      this._transform = options.transform;
+
+    if (typeof options.flush === 'function')
+      this._flush = options.flush;
+  }
+
+  this.once('prefinish', function() {
+    if (typeof this._flush === 'function')
+      this._flush(function(er) {
+        done(stream, er);
+      });
+    else
+      done(stream);
+  });
+}
+
+Transform.prototype.push = function(chunk, encoding) {
+  this._transformState.needTransform = false;
+  return Duplex.prototype.push.call(this, chunk, encoding);
+};
+
+// This is the part where you do stuff!
+// override this function in implementation classes.
+// 'chunk' is an input chunk.
+//
+// Call `push(newChunk)` to pass along transformed output
+// to the readable side.  You may call 'push' zero or more times.
+//
+// Call `cb(err)` when you are done with this chunk.  If you pass
+// an error, then that'll put the hurt on the whole operation.  If you
+// never call cb(), then you'll never get another chunk.
+Transform.prototype._transform = function(chunk, encoding, cb) {
+  throw new Error('not implemented');
+};
+
+Transform.prototype._write = function(chunk, encoding, cb) {
+  var ts = this._transformState;
+  ts.writecb = cb;
+  ts.writechunk = chunk;
+  ts.writeencoding = encoding;
+  if (!ts.transforming) {
+    var rs = this._readableState;
+    if (ts.needTransform ||
+        rs.needReadable ||
+        rs.length < rs.highWaterMark)
+      this._read(rs.highWaterMark);
+  }
+};
+
+// Doesn't matter what the args are here.
+// _transform does all the work.
+// That we got here means that the readable side wants more data.
+Transform.prototype._read = function(n) {
+  var ts = this._transformState;
+
+  if (ts.writechunk !== null && ts.writecb && !ts.transforming) {
+    ts.transforming = true;
+    this._transform(ts.writechunk, ts.writeencoding, ts.afterTransform);
+  } else {
+    // mark that we need a transform, so that any data that comes in
+    // will get processed, now that we've asked for it.
+    ts.needTransform = true;
+  }
+};
+
+
+function done(stream, er) {
+  if (er)
+    return stream.emit('error', er);
+
+  // if there's nothing in the write buffer, then that means
+  // that nothing more will ever be provided
+  var ws = stream._writableState;
+  var ts = stream._transformState;
+
+  if (ws.length)
+    throw new Error('calling transform done when ws.length != 0');
+
+  if (ts.transforming)
+    throw new Error('calling transform done when still transforming');
+
+  return stream.push(null);
+}
+
+},{"./_stream_duplex":32,"core-util-is":37,"inherits":10}],36:[function(require,module,exports){
+// A bit simpler than readable streams.
+// Implement an async ._write(chunk, encoding, cb), and it'll handle all
+// the drain event emission and buffering.
+
+'use strict';
+
+module.exports = Writable;
+
+/*<replacement>*/
+var processNextTick = require('process-nextick-args');
+/*</replacement>*/
+
+
+/*<replacement>*/
+var Buffer = require('buffer').Buffer;
+/*</replacement>*/
+
+Writable.WritableState = WritableState;
+
+
+/*<replacement>*/
+var util = require('core-util-is');
+util.inherits = require('inherits');
+/*</replacement>*/
+
+
+/*<replacement>*/
+var internalUtil = {
+  deprecate: require('util-deprecate')
+};
+/*</replacement>*/
+
+
+
+/*<replacement>*/
+var Stream;
+(function (){try{
+  Stream = require('st' + 'ream');
+}catch(_){}finally{
+  if (!Stream)
+    Stream = require('events').EventEmitter;
+}}())
+/*</replacement>*/
+
+var Buffer = require('buffer').Buffer;
+
+util.inherits(Writable, Stream);
+
+function nop() {}
+
+function WriteReq(chunk, encoding, cb) {
+  this.chunk = chunk;
+  this.encoding = encoding;
+  this.callback = cb;
+  this.next = null;
+}
+
+function WritableState(options, stream) {
+  var Duplex = require('./_stream_duplex');
+
+  options = options || {};
+
+  // object stream flag to indicate whether or not this stream
+  // contains buffers or objects.
+  this.objectMode = !!options.objectMode;
+
+  if (stream instanceof Duplex)
+    this.objectMode = this.objectMode || !!options.writableObjectMode;
+
+  // the point at which write() starts returning false
+  // Note: 0 is a valid value, means that we always return false if
+  // the entire buffer is not flushed immediately on write()
+  var hwm = options.highWaterMark;
+  var defaultHwm = this.objectMode ? 16 : 16 * 1024;
+  this.highWaterMark = (hwm || hwm === 0) ? hwm : defaultHwm;
+
+  // cast to ints.
+  this.highWaterMark = ~~this.highWaterMark;
+
+  this.needDrain = false;
+  // at the start of calling end()
+  this.ending = false;
+  // when end() has been called, and returned
+  this.ended = false;
+  // when 'finish' is emitted
+  this.finished = false;
+
+  // should we decode strings into buffers before passing to _write?
+  // this is here so that some node-core streams can optimize string
+  // handling at a lower level.
+  var noDecode = options.decodeStrings === false;
+  this.decodeStrings = !noDecode;
+
+  // Crypto is kind of old and crusty.  Historically, its default string
+  // encoding is 'binary' so we have to make this configurable.
+  // Everything else in the universe uses 'utf8', though.
+  this.defaultEncoding = options.defaultEncoding || 'utf8';
+
+  // not an actual buffer we keep track of, but a measurement
+  // of how much we're waiting to get pushed to some underlying
+  // socket or file.
+  this.length = 0;
+
+  // a flag to see when we're in the middle of a write.
+  this.writing = false;
+
+  // when true all writes will be buffered until .uncork() call
+  this.corked = 0;
+
+  // a flag to be able to tell if the onwrite cb is called immediately,
+  // or on a later tick.  We set this to true at first, because any
+  // actions that shouldn't happen until "later" should generally also
+  // not happen before the first write call.
+  this.sync = true;
+
+  // a flag to know if we're processing previously buffered items, which
+  // may call the _write() callback in the same tick, so that we don't
+  // end up in an overlapped onwrite situation.
+  this.bufferProcessing = false;
+
+  // the callback that's passed to _write(chunk,cb)
+  this.onwrite = function(er) {
+    onwrite(stream, er);
+  };
+
+  // the callback that the user supplies to write(chunk,encoding,cb)
+  this.writecb = null;
+
+  // the amount that is being written when _write is called.
+  this.writelen = 0;
+
+  this.bufferedRequest = null;
+  this.lastBufferedRequest = null;
+
+  // number of pending user-supplied write callbacks
+  // this must be 0 before 'finish' can be emitted
+  this.pendingcb = 0;
+
+  // emit prefinish if the only thing we're waiting for is _write cbs
+  // This is relevant for synchronous Transform streams
+  this.prefinished = false;
+
+  // True if the error was already emitted and should not be thrown again
+  this.errorEmitted = false;
+}
+
+WritableState.prototype.getBuffer = function writableStateGetBuffer() {
+  var current = this.bufferedRequest;
+  var out = [];
+  while (current) {
+    out.push(current);
+    current = current.next;
+  }
+  return out;
+};
+
+(function (){try {
+Object.defineProperty(WritableState.prototype, 'buffer', {
+  get: internalUtil.deprecate(function() {
+    return this.getBuffer();
+  }, '_writableState.buffer is deprecated. Use _writableState.getBuffer ' +
+     'instead.')
+});
+}catch(_){}}());
+
+
+function Writable(options) {
+  var Duplex = require('./_stream_duplex');
+
+  // Writable ctor is applied to Duplexes, though they're not
+  // instanceof Writable, they're instanceof Readable.
+  if (!(this instanceof Writable) && !(this instanceof Duplex))
+    return new Writable(options);
+
+  this._writableState = new WritableState(options, this);
+
+  // legacy.
+  this.writable = true;
+
+  if (options) {
+    if (typeof options.write === 'function')
+      this._write = options.write;
+
+    if (typeof options.writev === 'function')
+      this._writev = options.writev;
+  }
+
+  Stream.call(this);
+}
+
+// Otherwise people can pipe Writable streams, which is just wrong.
+Writable.prototype.pipe = function() {
+  this.emit('error', new Error('Cannot pipe. Not readable.'));
+};
+
+
+function writeAfterEnd(stream, cb) {
+  var er = new Error('write after end');
+  // TODO: defer error events consistently everywhere, not just the cb
+  stream.emit('error', er);
+  processNextTick(cb, er);
+}
+
+// If we get something that is not a buffer, string, null, or undefined,
+// and we're not in objectMode, then that's an error.
+// Otherwise stream chunks are all considered to be of length=1, and the
+// watermarks determine how many objects to keep in the buffer, rather than
+// how many bytes or characters.
+function validChunk(stream, state, chunk, cb) {
+  var valid = true;
+
+  if (!(Buffer.isBuffer(chunk)) &&
+      typeof chunk !== 'string' &&
+      chunk !== null &&
+      chunk !== undefined &&
+      !state.objectMode) {
+    var er = new TypeError('Invalid non-string/buffer chunk');
+    stream.emit('error', er);
+    processNextTick(cb, er);
+    valid = false;
+  }
+  return valid;
+}
+
+Writable.prototype.write = function(chunk, encoding, cb) {
+  var state = this._writableState;
+  var ret = false;
+
+  if (typeof encoding === 'function') {
+    cb = encoding;
+    encoding = null;
+  }
+
+  if (Buffer.isBuffer(chunk))
+    encoding = 'buffer';
+  else if (!encoding)
+    encoding = state.defaultEncoding;
+
+  if (typeof cb !== 'function')
+    cb = nop;
+
+  if (state.ended)
+    writeAfterEnd(this, cb);
+  else if (validChunk(this, state, chunk, cb)) {
+    state.pendingcb++;
+    ret = writeOrBuffer(this, state, chunk, encoding, cb);
+  }
+
+  return ret;
+};
+
+Writable.prototype.cork = function() {
+  var state = this._writableState;
+
+  state.corked++;
+};
+
+Writable.prototype.uncork = function() {
+  var state = this._writableState;
+
+  if (state.corked) {
+    state.corked--;
+
+    if (!state.writing &&
+        !state.corked &&
+        !state.finished &&
+        !state.bufferProcessing &&
+        state.bufferedRequest)
+      clearBuffer(this, state);
+  }
+};
+
+Writable.prototype.setDefaultEncoding = function setDefaultEncoding(encoding) {
+  // node::ParseEncoding() requires lower case.
+  if (typeof encoding === 'string')
+    encoding = encoding.toLowerCase();
+  if (!(['hex', 'utf8', 'utf-8', 'ascii', 'binary', 'base64',
+'ucs2', 'ucs-2','utf16le', 'utf-16le', 'raw']
+.indexOf((encoding + '').toLowerCase()) > -1))
+    throw new TypeError('Unknown encoding: ' + encoding);
+  this._writableState.defaultEncoding = encoding;
+};
+
+function decodeChunk(state, chunk, encoding) {
+  if (!state.objectMode &&
+      state.decodeStrings !== false &&
+      typeof chunk === 'string') {
+    chunk = new Buffer(chunk, encoding);
+  }
+  return chunk;
+}
+
+// if we're already writing something, then just put this
+// in the queue, and wait our turn.  Otherwise, call _write
+// If we return false, then we need a drain event, so set that flag.
+function writeOrBuffer(stream, state, chunk, encoding, cb) {
+  chunk = decodeChunk(state, chunk, encoding);
+
+  if (Buffer.isBuffer(chunk))
+    encoding = 'buffer';
+  var len = state.objectMode ? 1 : chunk.length;
+
+  state.length += len;
+
+  var ret = state.length < state.highWaterMark;
+  // we must ensure that previous needDrain will not be reset to false.
+  if (!ret)
+    state.needDrain = true;
+
+  if (state.writing || state.corked) {
+    var last = state.lastBufferedRequest;
+    state.lastBufferedRequest = new WriteReq(chunk, encoding, cb);
+    if (last) {
+      last.next = state.lastBufferedRequest;
+    } else {
+      state.bufferedRequest = state.lastBufferedRequest;
+    }
+  } else {
+    doWrite(stream, state, false, len, chunk, encoding, cb);
+  }
+
+  return ret;
+}
+
+function doWrite(stream, state, writev, len, chunk, encoding, cb) {
+  state.writelen = len;
+  state.writecb = cb;
+  state.writing = true;
+  state.sync = true;
+  if (writev)
+    stream._writev(chunk, state.onwrite);
+  else
+    stream._write(chunk, encoding, state.onwrite);
+  state.sync = false;
+}
+
+function onwriteError(stream, state, sync, er, cb) {
+  --state.pendingcb;
+  if (sync)
+    processNextTick(cb, er);
+  else
+    cb(er);
+
+  stream._writableState.errorEmitted = true;
+  stream.emit('error', er);
+}
+
+function onwriteStateUpdate(state) {
+  state.writing = false;
+  state.writecb = null;
+  state.length -= state.writelen;
+  state.writelen = 0;
+}
+
+function onwrite(stream, er) {
+  var state = stream._writableState;
+  var sync = state.sync;
+  var cb = state.writecb;
+
+  onwriteStateUpdate(state);
+
+  if (er)
+    onwriteError(stream, state, sync, er, cb);
+  else {
+    // Check if we're actually ready to finish, but don't emit yet
+    var finished = needFinish(state);
+
+    if (!finished &&
+        !state.corked &&
+        !state.bufferProcessing &&
+        state.bufferedRequest) {
+      clearBuffer(stream, state);
+    }
+
+    if (sync) {
+      processNextTick(afterWrite, stream, state, finished, cb);
+    } else {
+      afterWrite(stream, state, finished, cb);
+    }
+  }
+}
+
+function afterWrite(stream, state, finished, cb) {
+  if (!finished)
+    onwriteDrain(stream, state);
+  state.pendingcb--;
+  cb();
+  finishMaybe(stream, state);
+}
+
+// Must force callback to be called on nextTick, so that we don't
+// emit 'drain' before the write() consumer gets the 'false' return
+// value, and has a chance to attach a 'drain' listener.
+function onwriteDrain(stream, state) {
+  if (state.length === 0 && state.needDrain) {
+    state.needDrain = false;
+    stream.emit('drain');
+  }
+}
+
+
+// if there's something in the buffer waiting, then process it
+function clearBuffer(stream, state) {
+  state.bufferProcessing = true;
+  var entry = state.bufferedRequest;
+
+  if (stream._writev && entry && entry.next) {
+    // Fast case, write everything using _writev()
+    var buffer = [];
+    var cbs = [];
+    while (entry) {
+      cbs.push(entry.callback);
+      buffer.push(entry);
+      entry = entry.next;
+    }
+
+    // count the one we are adding, as well.
+    // TODO(isaacs) clean this up
+    state.pendingcb++;
+    state.lastBufferedRequest = null;
+    doWrite(stream, state, true, state.length, buffer, '', function(err) {
+      for (var i = 0; i < cbs.length; i++) {
+        state.pendingcb--;
+        cbs[i](err);
+      }
+    });
+
+    // Clear buffer
+  } else {
+    // Slow case, write chunks one-by-one
+    while (entry) {
+      var chunk = entry.chunk;
+      var encoding = entry.encoding;
+      var cb = entry.callback;
+      var len = state.objectMode ? 1 : chunk.length;
+
+      doWrite(stream, state, false, len, chunk, encoding, cb);
+      entry = entry.next;
+      // if we didn't call the onwrite immediately, then
+      // it means that we need to wait until it does.
+      // also, that means that the chunk and cb are currently
+      // being processed, so move the buffer counter past them.
+      if (state.writing) {
+        break;
+      }
+    }
+
+    if (entry === null)
+      state.lastBufferedRequest = null;
+  }
+  state.bufferedRequest = entry;
+  state.bufferProcessing = false;
+}
+
+Writable.prototype._write = function(chunk, encoding, cb) {
+  cb(new Error('not implemented'));
+};
+
+Writable.prototype._writev = null;
+
+Writable.prototype.end = function(chunk, encoding, cb) {
+  var state = this._writableState;
+
+  if (typeof chunk === 'function') {
+    cb = chunk;
+    chunk = null;
+    encoding = null;
+  } else if (typeof encoding === 'function') {
+    cb = encoding;
+    encoding = null;
+  }
+
+  if (chunk !== null && chunk !== undefined)
+    this.write(chunk, encoding);
+
+  // .end() fully uncorks
+  if (state.corked) {
+    state.corked = 1;
+    this.uncork();
+  }
+
+  // ignore unnecessary end() calls.
+  if (!state.ending && !state.finished)
+    endWritable(this, state, cb);
+};
+
+
+function needFinish(state) {
+  return (state.ending &&
+          state.length === 0 &&
+          state.bufferedRequest === null &&
+          !state.finished &&
+          !state.writing);
+}
+
+function prefinish(stream, state) {
+  if (!state.prefinished) {
+    state.prefinished = true;
+    stream.emit('prefinish');
+  }
+}
+
+function finishMaybe(stream, state) {
+  var need = needFinish(state);
+  if (need) {
+    if (state.pendingcb === 0) {
+      prefinish(stream, state);
+      state.finished = true;
+      stream.emit('finish');
+    } else {
+      prefinish(stream, state);
+    }
+  }
+  return need;
+}
+
+function endWritable(stream, state, cb) {
+  state.ending = true;
+  finishMaybe(stream, state);
+  if (cb) {
+    if (state.finished)
+      processNextTick(cb);
+    else
+      stream.once('finish', cb);
+  }
+  state.ended = true;
+}
+
+},{"./_stream_duplex":32,"buffer":58,"core-util-is":37,"events":62,"inherits":10,"process-nextick-args":39,"util-deprecate":41}],37:[function(require,module,exports){
+arguments[4][23][0].apply(exports,arguments)
+},{"buffer":58,"dup":23}],38:[function(require,module,exports){
+arguments[4][24][0].apply(exports,arguments)
+},{"dup":24}],39:[function(require,module,exports){
+(function (process){
+'use strict';
+
+if (!process.version ||
+    process.version.indexOf('v0.') === 0 ||
+    process.version.indexOf('v1.') === 0 && process.version.indexOf('v1.8.') !== 0) {
+  module.exports = nextTick;
+} else {
+  module.exports = process.nextTick;
+}
+
+function nextTick(fn) {
+  var args = new Array(arguments.length - 1);
+  var i = 0;
+  while (i < args.length) {
+    args[i++] = arguments[i];
+  }
+  process.nextTick(function afterTick() {
+    fn.apply(null, args);
+  });
+}
+
+}).call(this,require('_process'))
+},{"_process":65}],40:[function(require,module,exports){
+arguments[4][25][0].apply(exports,arguments)
+},{"buffer":58,"dup":25}],41:[function(require,module,exports){
+(function (global){
+
+/**
+ * Module exports.
+ */
+
+module.exports = deprecate;
+
+/**
+ * Mark that a method should not be used.
+ * Returns a modified function which warns once by default.
+ *
+ * If `localStorage.noDeprecation = true` is set, then it is a no-op.
+ *
+ * If `localStorage.throwDeprecation = true` is set, then deprecated functions
+ * will throw an Error when invoked.
+ *
+ * If `localStorage.traceDeprecation = true` is set, then deprecated functions
+ * will invoke `console.trace()` instead of `console.error()`.
+ *
+ * @param {Function} fn - the function to deprecate
+ * @param {String} msg - the string to print to the console when `fn` is invoked
+ * @returns {Function} a new "deprecated" version of `fn`
+ * @api public
+ */
+
+function deprecate (fn, msg) {
+  if (config('noDeprecation')) {
+    return fn;
+  }
+
+  var warned = false;
+  function deprecated() {
+    if (!warned) {
+      if (config('throwDeprecation')) {
+        throw new Error(msg);
+      } else if (config('traceDeprecation')) {
+        console.trace(msg);
+      } else {
+        console.warn(msg);
+      }
+      warned = true;
+    }
+    return fn.apply(this, arguments);
+  }
+
+  return deprecated;
+}
+
+/**
+ * Checks `localStorage` for boolean values for the given `name`.
+ *
+ * @param {String} name
+ * @returns {Boolean}
+ * @api private
+ */
+
+function config (name) {
+  // accessing global.localStorage can trigger a DOMException in sandboxed iframes
+  try {
+    if (!global.localStorage) return false;
+  } catch (_) {
+    return false;
+  }
+  var val = global.localStorage[name];
+  if (null == val) return false;
+  return String(val).toLowerCase() === 'true';
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],42:[function(require,module,exports){
+var Stream = (function (){
+  try {
+    return require('st' + 'ream'); // hack to fix a circular dependency issue when used with browserify
+  } catch(_){}
+}());
+exports = module.exports = require('./lib/_stream_readable.js');
+exports.Stream = Stream || exports;
+exports.Readable = exports;
+exports.Writable = require('./lib/_stream_writable.js');
+exports.Duplex = require('./lib/_stream_duplex.js');
+exports.Transform = require('./lib/_stream_transform.js');
+exports.PassThrough = require('./lib/_stream_passthrough.js');
+
+},{"./lib/_stream_duplex.js":32,"./lib/_stream_passthrough.js":33,"./lib/_stream_readable.js":34,"./lib/_stream_transform.js":35,"./lib/_stream_writable.js":36}],43:[function(require,module,exports){
+arguments[4][32][0].apply(exports,arguments)
+},{"./_stream_readable":44,"./_stream_writable":46,"core-util-is":47,"dup":32,"inherits":10,"process-nextick-args":49}],44:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"./_stream_duplex":43,"_process":65,"buffer":58,"core-util-is":47,"dup":34,"events":62,"inherits":10,"isarray":48,"process-nextick-args":49,"string_decoder/":50,"util":57}],45:[function(require,module,exports){
+arguments[4][35][0].apply(exports,arguments)
+},{"./_stream_duplex":43,"core-util-is":47,"dup":35,"inherits":10}],46:[function(require,module,exports){
+arguments[4][36][0].apply(exports,arguments)
+},{"./_stream_duplex":43,"buffer":58,"core-util-is":47,"dup":36,"events":62,"inherits":10,"process-nextick-args":49,"util-deprecate":51}],47:[function(require,module,exports){
+arguments[4][23][0].apply(exports,arguments)
+},{"buffer":58,"dup":23}],48:[function(require,module,exports){
+arguments[4][24][0].apply(exports,arguments)
+},{"dup":24}],49:[function(require,module,exports){
+arguments[4][39][0].apply(exports,arguments)
+},{"_process":65,"dup":39}],50:[function(require,module,exports){
+arguments[4][25][0].apply(exports,arguments)
+},{"buffer":58,"dup":25}],51:[function(require,module,exports){
+arguments[4][41][0].apply(exports,arguments)
+},{"dup":41}],52:[function(require,module,exports){
+module.exports = require("./lib/_stream_transform.js")
+
+},{"./lib/_stream_transform.js":45}],53:[function(require,module,exports){
 (function (process){
 var Transform = require('readable-stream/transform')
   , inherits  = require('util').inherits
@@ -5038,7 +7220,7 @@ module.exports.obj = through2(function (options, transform, flush) {
 })
 
 }).call(this,require('_process'))
-},{"_process":44,"readable-stream/transform":27,"util":64,"xtend":35}],33:[function(require,module,exports){
+},{"_process":65,"readable-stream/transform":52,"util":85,"xtend":56}],54:[function(require,module,exports){
 (function (process,Buffer){
 var through = require('through2')
 var duplexify = require('duplexify')
@@ -5049,7 +7231,7 @@ module.exports = WebSocketStream
 function WebSocketStream(target, protocols) {
   var stream, socket
   var socketWrite = process.title === 'browser' ? socketWriteBrowser : socketWriteNode
-  var proxy = through(socketWrite, socketEnd)
+  var proxy = through.obj(socketWrite, socketEnd)
 
   // use existing WebSocket object that was passed in
   if (typeof target === 'object') {
@@ -5064,7 +7246,7 @@ function WebSocketStream(target, protocols) {
   if (socket.readyState === 1) {
     stream = proxy
   } else {
-    stream = duplexify()
+    stream = duplexify.obj()
     socket.addEventListener("open", onready)
   }
 
@@ -5102,6 +7284,7 @@ function WebSocketStream(target, protocols) {
   }
 
   function onclose() {
+    stream.end();
     stream.destroy()
   }
 
@@ -5112,6 +7295,7 @@ function WebSocketStream(target, protocols) {
   function onmessage(event) {
     var data = event.data
     if (data instanceof ArrayBuffer) data = new Buffer(new Uint8Array(data))
+    else data = new Buffer(data)
     proxy.push(data)
   }
 
@@ -5123,7 +7307,7 @@ function WebSocketStream(target, protocols) {
 }
 
 }).call(this,require('_process'),require("buffer").Buffer)
-},{"_process":44,"buffer":37,"duplexify":28,"through2":32,"ws":34}],34:[function(require,module,exports){
+},{"_process":65,"buffer":58,"duplexify":28,"through2":53,"ws":55}],55:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -5168,8 +7352,10 @@ function ws(uri, protocols, opts) {
 
 if (WebSocket) ws.prototype = WebSocket.prototype;
 
-},{}],35:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 module.exports = extend
+
+var hasOwnProperty = Object.prototype.hasOwnProperty;
 
 function extend() {
     var target = {}
@@ -5178,7 +7364,7 @@ function extend() {
         var source = arguments[i]
 
         for (var key in source) {
-            if (source.hasOwnProperty(key)) {
+            if (hasOwnProperty.call(source, key)) {
                 target[key] = source[key]
             }
         }
@@ -5187,9 +7373,9 @@ function extend() {
     return target
 }
 
-},{}],36:[function(require,module,exports){
+},{}],57:[function(require,module,exports){
 
-},{}],37:[function(require,module,exports){
+},{}],58:[function(require,module,exports){
 /*!
  * The buffer module from node.js, for the browser.
  *
@@ -6502,7 +8688,7 @@ function decodeUtf8Char (str) {
   }
 }
 
-},{"base64-js":38,"ieee754":39,"is-array":40}],38:[function(require,module,exports){
+},{"base64-js":59,"ieee754":60,"is-array":61}],59:[function(require,module,exports){
 var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 ;(function (exports) {
@@ -6628,7 +8814,7 @@ var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 	exports.fromByteArray = uint8ToBase64
 }(typeof exports === 'undefined' ? (this.base64js = {}) : exports))
 
-},{}],39:[function(require,module,exports){
+},{}],60:[function(require,module,exports){
 exports.read = function(buffer, offset, isLE, mLen, nBytes) {
   var e, m,
       eLen = nBytes * 8 - mLen - 1,
@@ -6714,7 +8900,7 @@ exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128;
 };
 
-},{}],40:[function(require,module,exports){
+},{}],61:[function(require,module,exports){
 
 /**
  * isArray
@@ -6749,7 +8935,7 @@ module.exports = isArray || function (val) {
   return !! val && '[object Array]' == str.call(val);
 };
 
-},{}],41:[function(require,module,exports){
+},{}],62:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7052,11 +9238,11 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],42:[function(require,module,exports){
+},{}],63:[function(require,module,exports){
 arguments[4][10][0].apply(exports,arguments)
-},{"dup":10}],43:[function(require,module,exports){
+},{"dup":10}],64:[function(require,module,exports){
 arguments[4][24][0].apply(exports,arguments)
-},{"dup":24}],44:[function(require,module,exports){
+},{"dup":24}],65:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};
@@ -7115,7 +9301,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],45:[function(require,module,exports){
+},{}],66:[function(require,module,exports){
 (function (global){
 /*! http://mths.be/punycode v1.2.4 by @mathias */
 ;(function(root) {
@@ -7626,7 +9812,7 @@ process.umask = function() { return 0; };
 }(this));
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],46:[function(require,module,exports){
+},{}],67:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7712,7 +9898,7 @@ var isArray = Array.isArray || function (xs) {
   return Object.prototype.toString.call(xs) === '[object Array]';
 };
 
-},{}],47:[function(require,module,exports){
+},{}],68:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7799,37 +9985,145 @@ var objectKeys = Object.keys || function (obj) {
   return res;
 };
 
-},{}],48:[function(require,module,exports){
+},{}],69:[function(require,module,exports){
 'use strict';
 
 exports.decode = exports.parse = require('./decode');
 exports.encode = exports.stringify = require('./encode');
 
-},{"./decode":46,"./encode":47}],49:[function(require,module,exports){
+},{"./decode":67,"./encode":68}],70:[function(require,module,exports){
 arguments[4][17][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":50,"dup":17}],50:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":71,"dup":17}],71:[function(require,module,exports){
 arguments[4][18][0].apply(exports,arguments)
-},{"./_stream_readable":52,"./_stream_writable":54,"_process":44,"core-util-is":55,"dup":18,"inherits":42}],51:[function(require,module,exports){
+},{"./_stream_readable":73,"./_stream_writable":75,"_process":65,"core-util-is":76,"dup":18,"inherits":63}],72:[function(require,module,exports){
 arguments[4][19][0].apply(exports,arguments)
-},{"./_stream_transform":53,"core-util-is":55,"dup":19,"inherits":42}],52:[function(require,module,exports){
+},{"./_stream_transform":74,"core-util-is":76,"dup":19,"inherits":63}],73:[function(require,module,exports){
 arguments[4][20][0].apply(exports,arguments)
-},{"_process":44,"buffer":37,"core-util-is":55,"dup":20,"events":41,"inherits":42,"isarray":43,"stream":60,"string_decoder/":61}],53:[function(require,module,exports){
+},{"_process":65,"buffer":58,"core-util-is":76,"dup":20,"events":62,"inherits":63,"isarray":64,"stream":81,"string_decoder/":82}],74:[function(require,module,exports){
 arguments[4][21][0].apply(exports,arguments)
-},{"./_stream_duplex":50,"core-util-is":55,"dup":21,"inherits":42}],54:[function(require,module,exports){
+},{"./_stream_duplex":71,"core-util-is":76,"dup":21,"inherits":63}],75:[function(require,module,exports){
 arguments[4][22][0].apply(exports,arguments)
-},{"./_stream_duplex":50,"_process":44,"buffer":37,"core-util-is":55,"dup":22,"inherits":42,"stream":60}],55:[function(require,module,exports){
-arguments[4][23][0].apply(exports,arguments)
-},{"buffer":37,"dup":23}],56:[function(require,module,exports){
+},{"./_stream_duplex":71,"_process":65,"buffer":58,"core-util-is":76,"dup":22,"inherits":63,"stream":81}],76:[function(require,module,exports){
+(function (Buffer){
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+// NOTE: These type checking functions intentionally don't use `instanceof`
+// because it is fragile and can be easily faked with `Object.create()`.
+function isArray(ar) {
+  return Array.isArray(ar);
+}
+exports.isArray = isArray;
+
+function isBoolean(arg) {
+  return typeof arg === 'boolean';
+}
+exports.isBoolean = isBoolean;
+
+function isNull(arg) {
+  return arg === null;
+}
+exports.isNull = isNull;
+
+function isNullOrUndefined(arg) {
+  return arg == null;
+}
+exports.isNullOrUndefined = isNullOrUndefined;
+
+function isNumber(arg) {
+  return typeof arg === 'number';
+}
+exports.isNumber = isNumber;
+
+function isString(arg) {
+  return typeof arg === 'string';
+}
+exports.isString = isString;
+
+function isSymbol(arg) {
+  return typeof arg === 'symbol';
+}
+exports.isSymbol = isSymbol;
+
+function isUndefined(arg) {
+  return arg === void 0;
+}
+exports.isUndefined = isUndefined;
+
+function isRegExp(re) {
+  return isObject(re) && objectToString(re) === '[object RegExp]';
+}
+exports.isRegExp = isRegExp;
+
+function isObject(arg) {
+  return typeof arg === 'object' && arg !== null;
+}
+exports.isObject = isObject;
+
+function isDate(d) {
+  return isObject(d) && objectToString(d) === '[object Date]';
+}
+exports.isDate = isDate;
+
+function isError(e) {
+  return isObject(e) &&
+      (objectToString(e) === '[object Error]' || e instanceof Error);
+}
+exports.isError = isError;
+
+function isFunction(arg) {
+  return typeof arg === 'function';
+}
+exports.isFunction = isFunction;
+
+function isPrimitive(arg) {
+  return arg === null ||
+         typeof arg === 'boolean' ||
+         typeof arg === 'number' ||
+         typeof arg === 'string' ||
+         typeof arg === 'symbol' ||  // ES6 symbol
+         typeof arg === 'undefined';
+}
+exports.isPrimitive = isPrimitive;
+
+function isBuffer(arg) {
+  return Buffer.isBuffer(arg);
+}
+exports.isBuffer = isBuffer;
+
+function objectToString(o) {
+  return Object.prototype.toString.call(o);
+}
+}).call(this,require("buffer").Buffer)
+},{"buffer":58}],77:[function(require,module,exports){
 module.exports = require("./lib/_stream_passthrough.js")
 
-},{"./lib/_stream_passthrough.js":51}],57:[function(require,module,exports){
+},{"./lib/_stream_passthrough.js":72}],78:[function(require,module,exports){
 arguments[4][26][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":50,"./lib/_stream_passthrough.js":51,"./lib/_stream_readable.js":52,"./lib/_stream_transform.js":53,"./lib/_stream_writable.js":54,"dup":26,"stream":60}],58:[function(require,module,exports){
-arguments[4][27][0].apply(exports,arguments)
-},{"./lib/_stream_transform.js":53,"dup":27}],59:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":71,"./lib/_stream_passthrough.js":72,"./lib/_stream_readable.js":73,"./lib/_stream_transform.js":74,"./lib/_stream_writable.js":75,"dup":26,"stream":81}],79:[function(require,module,exports){
+arguments[4][52][0].apply(exports,arguments)
+},{"./lib/_stream_transform.js":74,"dup":52}],80:[function(require,module,exports){
 module.exports = require("./lib/_stream_writable.js")
 
-},{"./lib/_stream_writable.js":54}],60:[function(require,module,exports){
+},{"./lib/_stream_writable.js":75}],81:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7958,9 +10252,9 @@ Stream.prototype.pipe = function(dest, options) {
   return dest;
 };
 
-},{"events":41,"inherits":42,"readable-stream/duplex.js":49,"readable-stream/passthrough.js":56,"readable-stream/readable.js":57,"readable-stream/transform.js":58,"readable-stream/writable.js":59}],61:[function(require,module,exports){
+},{"events":62,"inherits":63,"readable-stream/duplex.js":70,"readable-stream/passthrough.js":77,"readable-stream/readable.js":78,"readable-stream/transform.js":79,"readable-stream/writable.js":80}],82:[function(require,module,exports){
 arguments[4][25][0].apply(exports,arguments)
-},{"buffer":37,"dup":25}],62:[function(require,module,exports){
+},{"buffer":58,"dup":25}],83:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -8669,14 +10963,14 @@ function isNullOrUndefined(arg) {
   return  arg == null;
 }
 
-},{"punycode":45,"querystring":48}],63:[function(require,module,exports){
+},{"punycode":66,"querystring":69}],84:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],64:[function(require,module,exports){
+},{}],85:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -9266,5 +11560,5 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":63,"_process":44,"inherits":42}]},{},[6])(6)
+},{"./support/isBuffer":84,"_process":65,"inherits":63}]},{},[6])(6)
 });
